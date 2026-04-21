@@ -426,15 +426,10 @@ def produce_relative_env_files(config,
                           shell,
                           for_package = binaries_dir_name)
 
-    # Little hack to put out_dir_Path as environment variable
-    if src.architecture.is_windows() :
-      src.replace_in_file(filepath, '"out_dir_Path', '"%out_dir_Path%' )
-      src.replace_in_file(filepath, '=out_dir_Path', '=%out_dir_Path%' )
-      src.replace_in_file(filepath, ';out_dir_Path', ';%out_dir_Path%' )
-    else:
-      src.replace_in_file(filepath, '"out_dir_Path', '"${out_dir_Path}' )
-      src.replace_in_file(filepath, ':out_dir_Path', ':${out_dir_Path}' )
-      src.replace_in_file(filepath, ';out_dir_Path', ';${out_dir_Path}' )
+    # put out_dir_Path as an environment variable
+    o = '%out_dir_Path%' if src.architecture.is_windows() else '${out_dir_Path}'
+    for p in ['"', '=', ';', ':']:
+        src.replace_in_file(filepath, '{}out_dir_Path'.format(p), '{}{}'.format(p,o))
 
     if exe_name:
         if src.architecture.is_windows():
