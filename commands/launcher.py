@@ -126,9 +126,7 @@ def generate_launch_file(config,
         kernel_cfg = src.product.get_product_config(config, "KERNEL")
         if not src.product.check_installation(config, kernel_cfg):
             raise src.SatException(_("KERNEL is not installed"))
-        install_dir_name=config.INTERNAL.config.install_dir
-        kernel_base_name=os.path.basename(kernel_cfg.install_dir)
-        kernel_root_dir = os.path.join(install_dir_name, kernel_base_name)
+        kernel_root_dir = kernel_cfg.install_dir
         # set kernel bin dir (considering fhs property)
         if src.get_property_in_product_cfg(kernel_cfg, "fhs"):
             bin_kernel_install_dir = os.path.join(kernel_root_dir,"bin") 
@@ -150,20 +148,20 @@ def generate_launch_file(config,
         if src.get_property_in_product_cfg(prod_info, "is_salome_application") == "yes":
             # if user choose -p option (env_info not None), the set appli name only if product was selected.
             if env_info == None or ( prod_name in env_info):
-                salome_application_name=prod_info.name
+                salome_application_name=prod_info.install_dir
             continue
 
     # if the application contains an application module, we set ABSOLUTE_APPLI_PATH to it.
     # if not we set it to KERNEL_INSTALL_DIR, which is sufficient, except for salome test
     if salome_application_name:
-        app_root_dir=os.path.join(install_dir_name,salome_application_name)
+        app_root_dir=salome_application_name
     elif kernel_root_dir:
         app_root_dir=kernel_root_dir
 
     # Add the APPLI and ABSOLUTE_APPLI_PATH variable
-    additional_env['APPLI'] = "out_dir_Path" + config.VARS.sep + launcher_name 
+    additional_env['APPLI'] = filepath
     if app_root_dir:
-        additional_env['ABSOLUTE_APPLI_PATH'] = "out_dir_Path" + config.VARS.sep + app_root_dir
+        additional_env['ABSOLUTE_APPLI_PATH'] = app_root_dir
 
     # create an environment file writer
     writer = src.environment.FileEnvWriter(config,
@@ -179,10 +177,10 @@ def generate_launch_file(config,
     global_environ.set_a_product("Python", logger)
     global_environ.set_python_libdirs()
     if 'modules_use_pip' in config.APPLICATION.properties and config.APPLICATION.properties['modules_use_pip']=='yes':
-        additional_env['sat_INIT_SYS_PATH_VALUE']= "out_dir_Path + " + config.VARS.sep + os.path.join(kernel_root_dir,global_environ.get("PYTHON_LIBDIR") )
+        additional_env['sat_INIT_SYS_PATH_VALUE']= os.path.join(kernel_root_dir,global_environ.get("PYTHON_LIBDIR") )
         additional_env['sat_MODULES_USE_PIP'] = '1'
     else:
-        additional_env['sat_INIT_SYS_PATH_VALUE']= "out_dir_Path + " + config.VARS.sep + bin_kernel_install_dir
+        additional_env['sat_INIT_SYS_PATH_VALUE']=  bin_kernel_install_dir
         additional_env['sat_MODULES_USE_PIP'] = '0'
     # Display some information
     if display:
@@ -198,20 +196,15 @@ def generate_launch_file(config,
                                  extra_env_dir=extra_env_dir,
                                  forBuild=False,  # for launch
                                  shell=shell,
-                                 for_package =install_dir_name,
                                  additional_env=additional_env,
                                  no_path_init=no_path_init)
     else:
         writer.write_env_file(filepath,
                               forBuild=False,  # for launch
                               shell=shell,
-                              for_package =install_dir_name,
                               additional_env=additional_env,
                               no_path_init=no_path_init)
     
-    # Little hack to put out_dir_Path outside the strings
-    src.replace_in_file(filepath, 'r"out_dir_Path', 'out_dir_Path + r"' )
-    src.replace_in_file(filepath, "r'out_dir_Path + ", "out_dir_Path + r'" )
 
     # ... and append the launch of the exe 
     if cmd:

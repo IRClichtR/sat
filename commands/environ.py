@@ -99,7 +99,6 @@ def write_all_source_files(config,
     files = []
     for_build = True
     for_launch = False
-    install_dir_name=config.INTERNAL.config.install_dir
     for shell in shells_list:
         if shell.name=="tcl":
             files.append(writer.write_tcl_files(for_launch,
@@ -108,23 +107,15 @@ def write_all_source_files(config,
             files.append(writer.write_env_file("%s_launch.%s" %
                                                (prefix, shell.extension),
                                                for_launch,
-                                               shell.name,
-                                               for_package=install_dir_name))
+                                               shell.name))
             files.append(writer.write_env_file("%s_build.%s" %
                                                (prefix, shell.extension),
                                                for_build,
-                                               shell.name,
-                                               for_package=install_dir_name))
+                                               shell.name))
 
     for f in files:
         if f:
             logger.write("    "+f+"\n", 3)
-
-        # put out_dir_Path as an environment variable
-        o = '%out_dir_Path%' if src.architecture.is_windows() else '${out_dir_Path}'
-        for p in ['"', '=', ';', ':']:
-            src.replace_in_file(f, '{}out_dir_Path'.format(p), '{}{}'.format(p,o))
-
     return files
 
 ##################################################
