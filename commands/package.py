@@ -504,24 +504,25 @@ def produce_install_bin_file(options,
         # substitute the template and write it in file
         content=src.template.substitute(installbin_template_path, d)
         installbin_file.write(content)
-        # remove launchers  if present
-        launcher_name = src.get_launcher_name(config)
         installbin_file.write("\n")
-        installbin_file.write("echo INFO: remove launcher {}\n".format(launcher_name))
-        installbin_file.write("if [ -f {} ]; then rm -f {}; fi\n".format(launcher_name, launcher_name))
-        if src.package_has_mesa_launcher(config):
-            installbin_file.write("echo INFO: remove MESA launcher mesa_{}\n".format(launcher_name))
-            installbin_file.write("if [ -f mesa_{} ]; then rm -f mesa_{}; fi\n".format(launcher_name, launcher_name))
-        sat_launcher_options="--with-extra.env.d" if options.with_extra_env_d else ""
-        if options.with_extra_env_d:
-            installbin_file.write("echo INFO: remove extra.env.d files if present.\n")
-            installbin_file.write("if [ -d extra.env.d ]; then rm -rf extra.env.d; fi\n")
-        installbin_file.write("echo INFO: generate a new launcher {}\n".format(launcher_name))
-        installbin_file.write("sat/sat launcher {} {}\n".format(config.APPLICATION.name, sat_launcher_options))
-        if src.package_has_mesa_launcher(config):
-            sat_launcher_options+=" --use_mesa"
-            installbin_file.write("echo INFO: generate a new MESA launcher mesa_{}\n".format(launcher_name))
-            installbin_file.write("sat/sat launcher {} --name mesa_{} {}\n".format(config.APPLICATION.name, launcher_name, sat_launcher_options))
+        if src.package_has_launcher(config):
+            # remove launchers  if present
+            launcher_name = src.get_launcher_name(config)
+            installbin_file.write("echo INFO: remove launcher {}\n".format(launcher_name))
+            installbin_file.write("if [ -f {} ]; then rm -f {}; fi\n".format(launcher_name, launcher_name))
+            if src.package_has_mesa_launcher(config):
+                installbin_file.write("echo INFO: remove MESA launcher mesa_{}\n".format(launcher_name))
+                installbin_file.write("if [ -f mesa_{} ]; then rm -f mesa_{}; fi\n".format(launcher_name, launcher_name))
+            sat_launcher_options="--with-extra.env.d" if options.with_extra_env_d else ""
+            if options.with_extra_env_d:
+                installbin_file.write("echo INFO: remove extra.env.d files if present.\n")
+                installbin_file.write("if [ -d extra.env.d ]; then rm -rf extra.env.d; fi\n")
+            installbin_file.write("echo INFO: generate a new launcher {}\n".format(launcher_name))
+            installbin_file.write("sat/sat launcher {} {}\n".format(config.APPLICATION.name, sat_launcher_options))
+            if src.package_has_mesa_launcher(config):
+                sat_launcher_options+=" --use_mesa"
+                installbin_file.write("echo INFO: generate a new MESA launcher mesa_{}\n".format(launcher_name))
+                installbin_file.write("sat/sat launcher {} --name mesa_{} {}\n".format(config.APPLICATION.name, launcher_name, sat_launcher_options))
         installbin_file.write("echo INFO: generate environment files\n")
         installbin_file.write("sat/sat environ {}\n".format(config.APPLICATION.name))
         installbin_file.write("\n")

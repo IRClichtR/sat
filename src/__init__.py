@@ -638,6 +638,14 @@ def activate_mesa_property(config):
         config.APPLICATION.addMapping( 'properties', pyconf.Mapping(), None )
     config.APPLICATION.properties.use_mesa="yes"
 
+def package_has_launcher(config):
+    """
+    check whether package has a launcher
+
+    :param config Config: The global configuration. It must have an application!
+    """
+    return "APPLICATION" in config and "profile" in config.APPLICATION and "launcher_name" in config.APPLICATION.profile
+
 def package_has_mesa_launcher(config):
     """
     check whether package has MESA launcher
