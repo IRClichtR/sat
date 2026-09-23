@@ -32,8 +32,9 @@ try:
 except ImportError:                                     # Python < 3.11
     tomllib = None
 
+import src
 import src.pyconf as PYF
-from src.configio.interp import parse_template
+from src.configio.interp import parse_template, TemplateError
 
 
 class Reader(abc.ABC):
@@ -135,7 +136,7 @@ class TomlReader(Reader):
                 raise ValueError("invalid TOML in %r: %s" % (path, error))
 
         config = PYF.Config()
-        self._fill(config, data, config, ())
+        self._fill(config, data, config, (), path)
 
         # same contract as src.pyconf.Config, applied once the tree exists
         if pwd:
@@ -146,13 +147,14 @@ class TomlReader(Reader):
                 config[key].PWD = directory
         return config
 
-    def _fill(self, container, data, config, path):
+    def _fill(self, container, data, config, path, source):
         """Populate a Mapping (or Config) from a dict, in file order."""
         for key in data:
-            value = self._convert(data[key], container, config, path + (key,))
+            value = self._convert(data[key], container, config,
+                                  path + (key,), source)
             container.addMapping(key, value, None, setting=True)
 
-    def _convert(self, value, parent, config, path):
+    def _convert(self, value, parent, config, path, source):
         """\
         Build the pyconf node for one TOML value.
 
@@ -161,12 +163,13 @@ class TomlReader(Reader):
                        walks this chain upwards, so it must be the real parent.
         :param config: The root Config, passed to every Reference built.
         :param path tuple: The key path of this value, used to locate bools.
+        :param source str: The file being read, for error messages.
         """
         if isinstance(value, dict):
             mapping = PYF.Mapping(parent)
             mapping.setPath(PYF.makePath(
                 object.__getattribute__(parent, 'path'), path[-1]))
-            self._fill(mapping, value, config, path)
+            self._fill(mapping, value, config, path, source)
             return mapping
 
         if isinstance(value, list):
@@ -177,14 +180,21 @@ class TomlReader(Reader):
                 # pyconf spells a sequence step '[n]' -- see makePath
                 sequence.append(
                     self._convert(item, sequence, config,
-                                  path + ("[%d]" % index,)), None)
+                                  path + ("[%d]" % index,), source), None)
             return sequence
 
         if isinstance(value, bool):
             return self._convert_bool(value, path)
 
         if isinstance(value, str):
-            return parse_template(value, config)
+            try:
+                return parse_template(value, config)
+            except TemplateError as error:
+                # interp is pure and knows only the string; the file and the
+                # key path exist here and nowhere else, so this is where the
+                # diagnostic gets assembled.
+                raise src.SatException(
+                    "%s: in %s: %s" % (source, self._where(path), error))
 
         if isinstance(value, (int, float)):
             return value

@@ -32,7 +32,9 @@ import tempfile
 import unittest
 
 import initializeTest  # noqa: F401  -- must be first, sets sys.path
+import src
 import src.pyconf as PYF
+from src.configio import readers as READERS
 from src.configio.readers import Reader, TomlReader, reader_for
 
 NEEDS_TOMLLIB = unittest.skipIf(sys.version_info[:2] < (3, 11),
@@ -145,9 +147,18 @@ class TestReferences(TomlTestCase):
         cfg = self.read('[x]\nnote = "costs $${100}"\n')
         self.assertEqual(cfg.x.note, "costs ${100}")
 
-    def test_unterminated_template_raises(self):
-        with self.assertRaises(Exception):
+    def test_unterminated_template_raises_a_SatException(self):
+        with self.assertRaises(src.SatException):
             self.read('[x]\nbad = "${unterminated"\n')
+
+    def test_template_error_carries_the_file_and_the_key_path(self):
+        # TemplateError knows the string; only the reader knows where it came from
+        path = self.write('[APPLICATION.environ.build]\nP = "${oops"\n', "ctx.toml")
+        with self.assertRaises(src.SatException) as caught:
+            TomlReader().read(path)
+        message = str(caught.exception)
+        self.assertIn("ctx.toml", message)
+        self.assertIn("APPLICATION.environ.build.P", message)
 
 
 @NEEDS_TOMLLIB
@@ -231,6 +242,24 @@ class TestReaderContract(TomlTestCase):
         with self.assertRaises(Exception) as caught:
             TomlReader().read(path)
         self.assertIn("bad.toml", str(caught.exception))
+
+
+class TestPythonVersionGuard(TomlTestCase):
+    """The first error a newcomer on Ubuntu 22.04 will meet."""
+
+    def test_missing_tomllib_names_the_file_and_points_at_pyconf(self):
+        path = self.write('[x]\na = "1"\n', "guard.toml")
+        saved = READERS.tomllib
+        READERS.tomllib = None
+        try:
+            with self.assertRaises(Exception) as caught:
+                TomlReader().read(path)
+        finally:
+            READERS.tomllib = saved
+        message = str(caught.exception)
+        self.assertIn("guard.toml", message)
+        self.assertIn(".pyconf", message)
+        self.assertIn("3.11", message)
 
 
 if __name__ == '__main__':
