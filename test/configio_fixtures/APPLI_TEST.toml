@@ -1,4 +1,9 @@
-# APPLI_TEST.pyconf, translated by hand.
+# test/APPLI_TEST/APPLI_TEST.pyconf, translated by hand.
+#
+# It lives here rather than beside its pyconf twin because
+# commands/config.py:465 puts test/APPLI_TEST on APPLICATIONPATH for the
+# unit tests, and two files naming one layer is fatal by design (task 7).
+# The fixture must not be the first thing to break the rule it verifies.
 #
 # Hand-translated on purpose: a conversion script would share assumptions with
 # the reader under test, and an oracle that shares assumptions with its subject

@@ -38,7 +38,7 @@ from configio_compare import (flatten, assert_equivalent,
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 PYCONF = os.path.join(HERE, "APPLI_TEST", "APPLI_TEST.pyconf")
-TOML = os.path.join(HERE, "APPLI_TEST", "APPLI_TEST.toml")
+TOML = os.path.join(HERE, "configio_fixtures", "APPLI_TEST.toml")
 
 NEEDS_TOMLLIB = unittest.skipIf(sys.version_info[:2] < (3, 11),
                                 "tomllib is stdlib from Python 3.11")
