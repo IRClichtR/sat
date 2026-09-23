@@ -25,6 +25,7 @@ reader_for, which dispatches on the file extension.
 """
 
 import abc
+import json
 import os
 
 try:
@@ -94,8 +95,82 @@ class PyconfReader(Reader):
 
 
 #: Where a bool is the only accepted spelling of "this product, at the
-#: application tag". Decision D10; see TomlReader._convert_bool.
+#: application tag". Decision D10; see TomlReader._check_bool.
 PRODUCTS_PATH = ("APPLICATION", "products")
+
+
+def _where(path):
+    """\
+    Render a key path for an error message, pyconf style.
+
+    :param path tuple: The keys walked to reach a value.
+    :rtype: str
+    """
+    rendered = ""
+    for step in path:
+        rendered = PYF.makePath(rendered, step)
+    return rendered
+
+
+def _fill(container, data, path, scalar):
+    """\
+    Populate a Mapping (or Config) from a dict, in document order.
+
+    Shared by every reader whose format parses to nested dicts and lists.
+    The formats differ only in what a leaf means, which is the scalar hook.
+
+    :param container: The Mapping or Config to populate.
+    :param data dict: The parsed document, or a sub-object of it.
+    :param path tuple: The key path of container, empty at the root.
+    :param scalar: Called as scalar(value, path) for every leaf.
+    """
+    for key in data:
+        container.addMapping(
+            key, _node(data[key], container, path + (key,), scalar),
+            None, setting=True)
+
+
+def _node(value, parent, path, scalar):
+    """\
+    Build one pyconf node.
+
+    :param value: The parsed value to convert.
+    :param parent: The container this node hangs from. Pyconf's resolver walks
+                   this chain upwards, so it must be the real parent: a node
+                   built with the wrong one prints correctly and fails to
+                   resolve.
+    :param path tuple: The key path of this value.
+    :param scalar: The leaf hook.
+    """
+    if isinstance(value, dict):
+        mapping = PYF.Mapping(parent)
+        mapping.setPath(PYF.makePath(
+            object.__getattribute__(parent, 'path'), path[-1]))
+        _fill(mapping, value, path, scalar)
+        return mapping
+
+    if isinstance(value, list):
+        sequence = PYF.Sequence(parent)
+        sequence.setPath(PYF.makePath(
+            object.__getattribute__(parent, 'path'), path[-1]))
+        for index, item in enumerate(value):
+            # pyconf spells a sequence step '[n]' -- see makePath
+            sequence.append(
+                _node(item, sequence, path + ("[%d]" % index,), scalar), None)
+        return sequence
+
+    return scalar(value, path)
+
+
+def _apply_pwd(config, pwd):
+    """Attach PWD to the loaded tree, as src.pyconf.Config does."""
+    if not pwd:
+        return
+    key, directory = pwd
+    if not key:
+        config.PWD = directory
+    else:
+        config[key].PWD = directory
 
 
 class TomlReader(Reader):
@@ -136,76 +211,42 @@ class TomlReader(Reader):
                 raise ValueError("invalid TOML in %r: %s" % (path, error))
 
         config = PYF.Config()
-        self._fill(config, data, config, (), path)
-
-        # same contract as src.pyconf.Config, applied once the tree exists
-        if pwd:
-            key, directory = pwd
-            if not key:
-                config.PWD = directory
-            else:
-                config[key].PWD = directory
+        _fill(config, data, (), self._scalar(config, path))
+        _apply_pwd(config, pwd)
         return config
 
-    def _fill(self, container, data, config, path, source):
-        """Populate a Mapping (or Config) from a dict, in file order."""
-        for key in data:
-            value = self._convert(data[key], container, config,
-                                  path + (key,), source)
-            container.addMapping(key, value, None, setting=True)
-
-    def _convert(self, value, parent, config, path, source):
+    def _scalar(self, config, source):
         """\
-        Build the pyconf node for one TOML value.
+        Build the leaf hook for one file.
 
-        :param value: The tomllib value to convert.
-        :param parent: The container this node hangs from. Pyconf's resolver
-                       walks this chain upwards, so it must be the real parent.
-        :param config: The root Config, passed to every Reference built.
-        :param path tuple: The key path of this value, used to locate bools.
-        :param source str: The file being read, for error messages.
+        Closes over the root config, which every Reference needs, and the file
+        path, which only the error messages need.
         """
-        if isinstance(value, dict):
-            mapping = PYF.Mapping(parent)
-            mapping.setPath(PYF.makePath(
-                object.__getattribute__(parent, 'path'), path[-1]))
-            self._fill(mapping, value, config, path, source)
-            return mapping
+        def scalar(value, path):
+            if isinstance(value, bool):
+                return self._check_bool(value, path)
 
-        if isinstance(value, list):
-            sequence = PYF.Sequence(parent)
-            sequence.setPath(PYF.makePath(
-                object.__getattribute__(parent, 'path'), path[-1]))
-            for index, item in enumerate(value):
-                # pyconf spells a sequence step '[n]' -- see makePath
-                sequence.append(
-                    self._convert(item, sequence, config,
-                                  path + ("[%d]" % index,), source), None)
-            return sequence
+            if isinstance(value, str):
+                try:
+                    return parse_template(value, config)
+                except TemplateError as error:
+                    # interp is pure and knows only the string; the file and
+                    # the key path exist here and nowhere else, so this is
+                    # where the diagnostic gets assembled.
+                    raise src.SatException(
+                        "%s: in %s: %s" % (source, _where(path), error))
 
-        if isinstance(value, bool):
-            return self._convert_bool(value, path)
+            if isinstance(value, (int, float)):
+                return value
 
-        if isinstance(value, str):
-            try:
-                return parse_template(value, config)
-            except TemplateError as error:
-                # interp is pure and knows only the string; the file and the
-                # key path exist here and nowhere else, so this is where the
-                # diagnostic gets assembled.
-                raise src.SatException(
-                    "%s: in %s: %s" % (source, self._where(path), error))
-
-        if isinstance(value, (int, float)):
-            return value
-
-        raise ValueError(
-            "%s: %r has no pyconf equivalent. TOML dates and times are not "
-            "supported; quote the value to store it as a string."
-            % (self._where(path), value))
+            raise ValueError(
+                "%s: %r has no pyconf equivalent. TOML dates and times are "
+                "not supported; quote the value to store it as a string."
+                % (_where(path), value))
+        return scalar
 
     @staticmethod
-    def _convert_bool(value, path):
+    def _check_bool(value, path):
         """\
         Apply decision D10.
 
@@ -216,7 +257,7 @@ class TomlReader(Reader):
         Both values of a bool are therefore indistinguishable, and wrong in
         opposite directions, so a bool is only accepted where it is unambiguous.
         """
-        where = TomlReader._where(path)
+        where = _where(path)
         if path[:2] != PRODUCTS_PATH or len(path) != 3:
             raise ValueError(
                 "%s: booleans are not configuration values here. SAT compares "
@@ -230,13 +271,46 @@ class TomlReader(Reader):
                 "to remove the product." % where)
         return True
 
-    @staticmethod
-    def _where(path):
-        """Render a key path for an error message, pyconf style."""
-        rendered = ""
-        for step in path:
-            rendered = PYF.makePath(rendered, step)
-        return rendered
+
+class JsonReader(Reader):
+    """\
+    Reader for the JSON lock.
+
+    The lock is not a report: it is the artifact SAT executes against, so this
+    is on the hot path of every invocation in the TOML world and must produce a
+    Config that product.py and every command can use unchanged.
+
+    It parses no templates. A resolved lock holds no references, and a ${} seen
+    here means a raw diagnostic dump was handed to the wrong loader, so the
+    string is left inert rather than quietly revived. D10 does not apply
+    either: it governs what a person may write in TOML, not what a generated
+    lock may contain.
+    """
+
+    extension = ".json"
+
+    def read(self, path, pwd=None):
+        """\
+        Load a JSON lock.
+
+        :param path str: The file to read.
+        :param pwd tuple: A (section, directory) pair, or None.
+        :return: The loaded configuration.
+        :rtype: class 'src.pyconf.Config'
+        :raise ValueError: If the file is not valid JSON.
+        """
+        with open(path) as stream:
+            try:
+                data = json.load(stream)
+            except ValueError as error:
+                raise ValueError("invalid JSON in %r: %s" % (path, error))
+
+        config = PYF.Config()
+        # json yields only str, int, float, bool and None, all of which pyconf
+        # stores as they are -- so the leaf hook is the identity.
+        _fill(config, data, (), lambda value, path: value)
+        _apply_pwd(config, pwd)
+        return config
 
 
 # The one place a concrete reader class is named. A format is registered once
@@ -244,6 +318,7 @@ class TomlReader(Reader):
 _READERS = {
     PyconfReader.extension: PyconfReader,
     TomlReader.extension: TomlReader,
+    JsonReader.extension: JsonReader,
 }
 
 
