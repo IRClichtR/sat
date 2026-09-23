@@ -48,6 +48,154 @@ Measured against the real corpus: 461 `.pyconf` files in `SAT_SALOME`
 The semantic surface TOML must cover is therefore small: mappings, sequences,
 scalars, comments, references, and `+` concatenation.
 
+### Application layer schema, measured
+
+The 162 application files in `SAT_SALOME/applications` carry two top-level keys:
+`APPLICATION` (162/162) and `__overwrite__` (127/162).
+
+**`APPLICATION` scalars** — counts are files out of 162:
+
+| key | files | type | observed |
+|---|---|---|---|
+| `name` | 162 | str | `'MEDCOUPLING-9.12.0'` |
+| `workdir` | 162 | **Expression** | `$LOCAL.workdir + $VARS.sep + $APPLICATION.name + '-' + $VARS.dist` |
+| `tag` | 161 | str | `'master'`, `'V9_12_0'` |
+| `base` | 157 | str | `'no'`, `'base'` |
+| `debug` | 150 | str | `'no'` |
+| `python3` | 146 | str | `'yes'` |
+| `dev` | 87 | str | `'no'` |
+| `verbose` | 80 | str | `'no'` |
+| `cmake_generator` | 30 | str | `'Visual Studio 16 2019'` |
+| `cmake_build_type` | 12 | str | `'Release'` |
+| `use_pyside` | 9 | str | `'no'` |
+| `get_method` | 2 | str | `'git'` |
+| `grid_to_test` | 1 | str | `'SALOME_V7'` |
+
+Read by SAT but present in none of the 162: `hook`, `hpc`, `rm_products`,
+`rm_products_for_all_distributions`, `version_salome`. Rare or legacy; the schema
+must still admit them.
+
+**Arrays:** `platform` (43 files, e.g. `['CO8', 'CO7', 'DB09', 'UB22.04']`) and
+`dev_products` (1 file).
+
+**Fixed-schema sub-tables:**
+
+| table | files | keys |
+|---|---|---|
+| `test_base` | 161 | `name`, `tag` |
+| `profile` | 89 | `launcher_name` 79, `product` 8; `exe` read by code |
+| `virtual_app` | 42 | `name`, `application_name`; `catalog`, `configure` read by code |
+| `properties` | 148 | `single_install_dir` 147, `pip` 146, `pip_install_dir` 146, `repo_dev` 87, `mesa_launcher_in_package` 79, `git_server` 61, `modules_use_pip` 13 |
+
+`properties` is shared with product files. SAT reads about twenty property names in
+total; only those seven ever appear at application level.
+
+**Open key spaces** — no fixed schema, any name is legal:
+
+- `environ`: `build` (151 files) and `launch` (146) are sub-tables; any other key is a
+  plain variable set in both phases. 15 distinct direct names across the corpus.
+- `products`: ~15,400 entries in three value shapes — string 11,484 (version or
+  `'native'`), bool 2,924 (a bare name, no value), table 1,020 (override, with keys
+  `tag` 879, `section` 720, `base` 562, `hpc` 492, `dev` 101, `verbose` 69).
+
+**`__overwrite__`** is a sequence of mappings, each with a `__condition__` string and
+dotted-path assignments such as `'APPLICATION.products.scipy' : '1.5.2'`.
+
+### Four consequences for the TOML surface
+
+| # | observation | consequence |
+|---|---|---|
+| 1 | `'yes'`/`'no'` are **strings**, and SAT compares against `'yes'` | TOML makes `true`/`false` natural. A file written with `debug = false` produces a value that compares unequal to `'no'` with no error. Either the reader coerces booleans in these positions, or the schema forbids them. Affects `debug`, `python3`, `dev`, `verbose`, `base`, `use_pyside` and most of `properties`. |
+| 2 | 2,924 product entries are a **bare name** with no value | pyconf reads a lone key as `key : True` (`src/pyconf.py:1320`), and `get_product_config` turns that into `version = APPLICATION.tag` (`src/product.py:78`). TOML has no bare key, so the entry must be written `CONFIGURATION = true` or `CONFIGURATION = {}`. Note that `false` takes the *same* branch — `isinstance(version, bool)` — and product membership is by key presence only (`src/product.py:796`), so `SMESH = false` enables SMESH. The reader must refuse it. |
+| 3 | `__overwrite__` keys are **dotted paths** | `"APPLICATION.products.scipy" = "1.5.2"` must stay quoted. Unquoted, TOML nests it into three tables: same characters, different document. |
+| 4 | references are **420 nodes over 8 key paths**, in 162/162 files | 414 Expression, 6 Reference. `APPLICATION.workdir` 162, `environ.build.CONFIGURATION_ROOT_DIR` 151, `environ.build.RESTRICTED_ROOT_DIR` 75, `products.mesa.tag` 11, `environ.SALOME_APPLICATION_NAME` 6, `products.{cgal,cork,libigl}.tag` 5 each. A narrow surface, but present in every file — §4's grammar cannot be skipped. `$VARS.sep` alone accounts for 614 of the reference uses: it is `os.path.sep` (`commands/config.py:148`), so the mechanism is what keeps paths platform-neutral in the data layer. Alternatives to `${}` are rejected in §10. |
+
+Items 1 and 2 are format-conversion decisions rather than parser decisions, and belong
+to the TOML reader. Item 3 is a documentation hazard for whoever writes the files.
+
+### A complete application file
+
+What the end state looks like for the person writing configuration. This is
+`SALOME-9.12.0-MPI.pyconf` transposed, with the products block trimmed to one entry of
+each kind; everything else is as it appears in the real file. It parses with `tomllib`
+and loads through `TomlReader`.
+
+```toml
+[APPLICATION]
+name     = "SALOME-9.12.0-MPI"
+workdir  = "${LOCAL.workdir}${VARS.sep}${APPLICATION.name}-${VARS.dist}"
+tag      = "V9_12_0"
+dev      = "no"
+verbose  = "no"
+debug    = "no"
+base     = "no"
+python3  = "yes"
+platform = ["CO7"]
+
+[APPLICATION.environ]
+SALOME_trace   = "local"
+SALOME_MODULES = "SHAPER,SHAPERSTUDY,GEOM,SMESH,PARAVIS,YACS,JOBMANAGER"
+
+[APPLICATION.environ.build]
+CONFIGURATION_ROOT_DIR      = "${workdir}${VARS.sep}SOURCES${VARS.sep}CONFIGURATION"
+RESTRICTED_ROOT_DIR         = "${workdir}${VARS.sep}SOURCES${VARS.sep}RESTRICTED"
+SALOME_USE_64BIT_IDS        = "1"
+VTK_SMP_IMPLEMENTATION_TYPE = "TBB"
+SALOME_GMSH_HEADERS_STD     = "1"
+
+[APPLICATION.environ.launch]
+PYTHONIOENCODING     = "UTF_8"
+SALOME_MODULES_ORDER = "SHAPER:SHAPERSTUDY:GEOM:SMESH"
+ROOT_SALOME_INSTALL  = "$PRODUCT_ROOT_DIR"
+SALOME_ON_DEMAND     = "HIDE"
+
+[APPLICATION.products]
+Python        = "native"
+boost         = "1.58.0"
+CONFIGURATION = {}
+KERNEL        = true
+MEDCOUPLING   = { tag = "V9_12_0", section = "default_MPI" }
+mesa          = { tag = "${APPLICATION.tag}" }
+
+[APPLICATION.profile]
+launcher_name = "salome"
+
+[APPLICATION.test_base]
+name = "SALOME"
+tag  = "SalomeV9"
+
+[APPLICATION.properties]
+mesa_launcher_in_package = "yes"
+git_server               = "tuleap"
+pip                      = "yes"
+pip_install_dir          = "python"
+single_install_dir       = "no"
+
+[[__overwrite__]]
+__condition__              = "VARS.dist in ['FD30']"
+"APPLICATION.products.gcc" = "9.3.0"
+
+[[__overwrite__]]
+__condition__                = "VARS.dist in ['FD32']"
+"APPLICATION.products.scipy" = "1.5.2"
+```
+
+There is no declared schema for these keys yet -- the inventory above is measured from
+the corpus, not enforced by code -- so this snippet is the reference for what a written
+file should look like until one exists.
+
+**What to notice, in the order it bites:**
+
+| | |
+|---|---|
+| `workdir` | `${LOCAL.workdir}` and `${VARS.sep}` come from layers this file never sees. The reference mechanism is what keeps the path platform-neutral (§2, consequence 4). |
+| `${workdir}` in `environ.build` | a bare name, resolved by walking **up** the parent chain from `environ.build` to `APPLICATION`. It does not need the full path, exactly as in pyconf. |
+| `ROOT_SALOME_INSTALL` | `"$PRODUCT_ROOT_DIR"` stays literal: `$` not followed by `{` is an ordinary character (§4). A shell variable passes through untouched. |
+| `dev`, `debug`, `python3`, `properties.*` | quoted `"no"` / `"yes"`, never `false` / `true`. SAT compares against those strings, so a boolean would silently read as `"no"` (D10). |
+| `CONFIGURATION = {}` | the canonical "include at `APPLICATION.tag`, no overrides". `KERNEL = true` is the accepted alias; `false` is refused (D10). |
+| `VTK_SMP_IMPLEMENTATION_TYPE` | `"TBB"` was a bare unquoted `TBB` in pyconf. TOML forces the quotes, which removes a real ambiguity. |
+| `[[__overwrite__]]` | an array of tables. The assignment keys **must stay quoted** -- unquoted, `APPLICATION.products.gcc` would nest into three tables instead of naming one key (§2, consequence 3). |
+
 ### Premise correction
 
 The source prompt states TOML has "interpolation of variables". It does not —
@@ -69,6 +217,7 @@ top as a string convention we parse ourselves (§4).
 | D7 | The lock is **platform-evaluated**: products are collapsed to their single applicable section, other platforms discarded | See §5 — this is what removes the eager-resolution hazard |
 | D8 | Collapsed products are stored **flat with a `__section__` marker**; `get_product_config` gains an early branch to use them verbatim | The platform decision is made exactly once, so runtime cannot diverge from the lock |
 | D9 | `src/pyconf.py` is **not modified** | Hard constraint from the prompt |
+| D10 | A `bool` is valid **only** inside `APPLICATION.products`, and only as `true`. The canonical spelling of a product with no overrides is `{}`; `true` is an accepted alias; `false` is refused. Booleans anywhere else raise, naming the key | A bool never equals a str, so `debug = true` fails `== "yes"` (`src/compilation.py:59`) and reads as **off**, while `SMESH = false` passes `isinstance(version, bool)` (`src/product.py:77`) and reads as **enabled** -- both silently, in opposite directions. Coercion would need a complete list of yes/no-typed keys, which `properties` (open-ended, shared with product files) makes impossible to maintain; rejection needs no list. `{}` routes through the Mapping branch to the same `version = APPLICATION.tag` with no value to mistype. Two properties worth recording, since both are easy to re-open later: the rule is **positional**, so a bool reaching the products position by the `__overwrite__` dotted-key route (`"APPLICATION.products.SMESH" = false`) is refused too, where coercion would have silently assigned the *version string* `"no"`; and rejection is the **reversible** choice -- a file written under the strict rule stays valid if the rule is later relaxed to coercion, whereas a file written under coercion breaks if the rule is ever tightened. Measured cost to the corpus: zero. Across the 162 application files there is no bool anywhere outside `APPLICATION.products.<name>`, and none in any `__overwrite__` assignment. The cost is ergonomic -- see §13 |
 
 ### D5 note — the version constraint is softer than it looks
 
@@ -252,6 +401,10 @@ existing SAT behaviour then acts as a test for the TOML path.
 | Keep verbatim pyconf expression syntax inside TOML strings | Mechanical migration, but opaque to TOML tooling and depends on a pyconf internal entry point |
 | JSON as resolved-only, or raw-only | Resolved-only breaks the roundtrip requirement; raw-only defeats the "bash can parse it" motivation |
 | Committed, machine-independent lock | A resolved SAT config is machine-specific; a portable lock would require classifying every key as portable or local |
+| **Structured reference arrays** (`workdir = [{ref="LOCAL.workdir"}, ...]`) instead of `${}` strings | TOML parses the structure, so no string grammar is needed and values become machine-checkable -- but it is unpleasant to write for the common case, still needs a resolver, and would have to apply to all 8 reference paths including `products.cgal.tag`, where it is absurd |
+| **Forbidding references in TOML**, resolving everything at lock time | `${workdir}` inside `environ.build` refers to a sibling key in the same file; there is no earlier point at which SAT could compute it. The user would be asked to paste an absolute path |
+| **Alternative delimiters** (`{LOCAL.workdir}`, `@LOCAL.workdir`) | Cosmetic. `${}` is safer because `{` occurs in values such as `cmake_generator` and in CMake-flavoured strings generally |
+| **Defaulting `workdir` in SAT code** and omitting it from TOML | Tempting -- 162 files carry only two formulas, so it is a convention wearing a costume. But `$VARS.sep` is `os.path.sep` (`commands/config.py:148`) and is referenced 614 times across the corpus, so the grammar is required by the other 151 files regardless. Removing `workdir` would save one key while keeping the whole parser, and would make the TOML and pyconf layers express the same thing differently -- the divergence §9's oracle exists to catch. Revisit as a follow-up, not as part of this feature |
 | Vendored TOML parser, or `tomli` dependency | A subset parser that mis-reads valid TOML is a real hazard; a pip dependency fails on a fresh git clone. §3 D5 shows the constraint is soft |
 | **Universal lock pipeline** (all configs, including pure pyconf) | Imposes eager resolution on all 461 existing config files; `ConfigResolutionError` is a hard raise, so this surfaces latent failures in configs that work today |
 | **Sidecar lock** (written but never read back) | Contradicts the model — the lock would be a report, not the execution artifact |
@@ -277,3 +430,49 @@ existing SAT behaviour then acts as a test for the TOML path.
 
 Backtick evaluation, `@include`, arithmetic beyond `+`, a TOML writer, a vendored
 TOML parser, a `RESOLVED` convenience section for jq, and committed portable locks.
+
+---
+
+## 13. Evolution — if SAT detaches further from pyconf
+
+Several decisions here are shaped by one constraint: the object model and the value
+conventions are pyconf's, because 461 files and every consumer in `src/` and
+`commands/` assume them. That constraint is not permanent, and D10 in particular is
+the visible cost of it. If pyconf ever stops being the lingua franca, the following
+becomes available — in this order, because each step makes the next one safe.
+
+**Step 1 — grow the oracle into coverage.** §9's differential test exists to compare
+two loaders. Its more valuable second life is as the regression net that `src/product.py`
+and `src/environment.py` have never had: 11 test files today, 3 of which touch either.
+Nothing below should be attempted before that net exists.
+
+**Step 2 — centralise the yes/no test.** 58 direct `== "yes"` / `== "no"` comparisons
+across 14 files (`src/product.py` 19, `commands/package.py` 11, `src/environment.py` 10),
+plus the two helpers `appli_test_property` and `product_test_property` already used at
+33 call sites. Route all of them through one predicate that accepts `True` and `"yes"`
+alike. This is mechanical and behaviour-preserving: pyconf files keep passing strings
+and keep working.
+
+Note the hidden half. Values are not only compared, they are **emitted** —
+`src/environment.py:896` writes `pi.base` straight into a generated environment, and
+formats it into a `module load` line two statements later. Emission sites cannot be
+found by grepping for a comparison; they look like ordinary variable use, so this step
+is an audit by reading, not by pattern.
+
+**Step 3 — relax the reader.** Only once steps 1 and 2 hold can `_convert_bool` start
+returning `True` where it currently raises. This is why D10 rejects rather than coerces:
+every TOML file written under the strict rule is still valid the day the rule loosens,
+so no user's configuration is invalidated by the change. Coercing today would spend
+that option for an ergonomic gain available later anyway.
+
+**What would still not follow.** Two residuals survive any amount of detachment,
+because neither is about pyconf:
+
+- `environ` is an open key space whose values become environment variables. `true`
+  rendered as `"yes"` may not be what the consuming program wants — the corpus writes
+  `SALOME_USE_64BIT_IDS = "1"`. No rule infers the right spelling; only the author knows.
+- Distinguishing a bool typed into a string-valued key (`tag = true`) from a bool meant
+  as a flag requires knowing which keys are string-typed. That is a **schema**, and §2's
+  inventory is measured from the corpus rather than declared. Writing that schema down
+  is the prerequisite, and it is a larger piece of work than anything above — it is also
+  what would let TOML tooling validate a SAT configuration before SAT ever reads it.

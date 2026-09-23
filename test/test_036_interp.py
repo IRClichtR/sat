@@ -168,6 +168,14 @@ class TestBuild(unittest.TestCase):
         self.assertIsInstance(rv.lhs.lhs, PYF.Reference)
         self.assertEqual(rv.lhs.rhs, "/SOURCES/")
 
+    def test_expression_can_start_with_a_literal(self):
+        # the only shape where operands[0] is a str, not a Reference
+        rv = parse_template("boost-${APPLICATION.products.boost}.tgz", self.cfg)
+        self.assertIsInstance(rv, PYF.Expression)
+        self.assertEqual(rv.lhs.lhs, "boost-")
+        self.assertIsInstance(rv.lhs.rhs, PYF.Reference)
+        self.assertEqual(rv.rhs, ".tgz")
+
     def test_bad_path_inside_a_reference_raises(self):
         with self.assertRaises(TemplateError):
             parse_template("${A..b}", self.cfg)
