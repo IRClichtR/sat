@@ -110,11 +110,13 @@ class TestReaderFor(unittest.TestCase):
             reader_for("x.ini")
         self.assertIn(".ini", str(caught.exception))
 
-    def test_does_not_pre_register_json(self):
-        # .json is registered by its own task; until then it must raise.
-        # .toml was registered by task 3 and is covered in test_038.
-        with self.assertRaises(ValueError):
-            reader_for("x.json")
+    def test_only_formats_with_a_reader_are_registered(self):
+        # the registry must never name an extension nothing can load;
+        # each format's own dispatch is tested with its reader
+        from src.configio.readers import _READERS
+        self.assertEqual(sorted(_READERS), [".json", ".pyconf", ".toml"])
+        for extension, reader in _READERS.items():
+            self.assertEqual(reader.extension, extension)
 
     def test_returns_a_fresh_reader_each_call(self):
         self.assertIsNot(reader_for("x.pyconf"), reader_for("x.pyconf"))
