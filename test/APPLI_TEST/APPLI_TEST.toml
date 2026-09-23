@@ -1,0 +1,47 @@
+# APPLI_TEST.pyconf, translated by hand.
+#
+# Hand-translated on purpose: a conversion script would share assumptions with
+# the reader under test, and an oracle that shares assumptions with its subject
+# is not an oracle. test_039_equivalence.py asserts the two load identically.
+#
+# One structural difference is unavoidable. TOML requires a table's scalars to
+# precede its sub-tables, so grid_to_test moves up beside the other APPLICATION
+# scalars instead of sitting between products and profile. Key order carries no
+# meaning at this level, and the oracle compares by path rather than by order.
+
+[APPLICATION]
+name         = "APPLI_TEST"
+workdir      = "${LOCAL.workdir}${VARS.sep}${APPLICATION.name}-${VARS.dist}"
+base         = "base"
+tag          = "master"
+get_method   = "git"
+grid_to_test = "SALOME_V8"
+
+[APPLICATION.environ]
+ACCEPT_SALOME_WARNINGS = "1"
+LC_NUMERIC             = "C"
+TESTS_ROOT_DIR         = "/tmp/${VARS.user}/TESTS/APPLI_TEST"
+
+[APPLICATION.products]
+# PREREQUISITES
+Python = "native"
+
+# SALOME MODULES -- pyconf's bare-key shorthand becomes an explicit true
+CONFIGURATION = true
+MEDCOUPLING   = true
+KERNEL        = true
+GUI           = true
+GEOM          = true
+SMESH         = true
+
+[APPLICATION.profile]
+launcher_name = "appli_test"
+product       = "SALOME"
+
+[APPLICATION.virtual_app]
+name             = "appli_test"
+application_name = "APPLI"
+
+[APPLICATION.test_base]
+name = "SALOME"
+tag  = "SalomeV8"
