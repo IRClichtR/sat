@@ -535,3 +535,71 @@ pyconf allows something TOML does not spell the same way: a bare word value now 
 quotes, a bare product key becomes `{}` or `true`, a yes/no flag stays a quoted string
 rather than becoming a boolean (§3, D10), and an `__overwrite__` target must be quoted
 so TOML does not nest it. The worked example in §2 shows all four in place.
+
+---
+
+## 15. Impact map — what changes for existing users
+
+Tasks 1 to 7 add modules nothing calls; no existing behaviour can change. Tasks 8 to 11
+modify code every SAT invocation runs. This section enumerates each mechanism they
+touch, who notices, and what must be said to users before it ships.
+
+The governing claim is §3's hard constraint: *a configuration that is 100% pyconf must
+be bit-for-bit unaffected.* Table A is where that claim is actually at risk.
+
+### A. Mechanisms that change for users who write no TOML at all
+
+| # | mechanism | task, site | what changes | risk |
+|---|---|---|---|---|
+| A1 | `get_product_config` gains an early branch | 9, `src/product.py:38` | every product resolution for every user runs new code. The branch keys off `__section__`, absent from any pyconf tree, so the else path must be byte-identical | **highest.** 11 modules consume `get_product_config`/`get_product_section`, and the repo has 11 test files of which 3 touch `product` or `environment` at all |
+| A2 | layer paths go through `resolve_layer` | 10, `commands/config.py` 282, 303, 372, 476, 524, 568 | path construction moves out of `get_config`. Same answer expected, different code producing it | high. Site 476 does not open a file today -- it hands a bare name to `streamOpener` and lets pyconf search `APPLICATIONPATH`. Taking that back changes *how* the application is found even when *what* is found is identical |
+| A3 | two files for one layer becomes fatal | 7 + 10, `discovery.resolve_layer` | a stray `local.toml` beside `local.pyconf` stops the run with `AmbiguousLayerError` | low today, since no `.toml` exists anywhere. It is a new failure mode a user can create by accident later |
+| A4 | `sat init`, `sat config` writes route through `writer_for_layer` | 11, `commands/init.py` ×3, `commands/config.py:651`, `commands/jobs.py:1773` | a pyconf layer still writes exactly as today | low, but it is five call sites on the write path of a command users run early |
+
+**A1 and A2 are the whole risk of the feature.** Neither is TOML-specific: they are
+edits to the shared path, made for the benefit of files that do not exist yet. The
+mitigation is §9's oracle, which is why §13 step 1 says to grow it into real coverage
+of `product.py` and `environment.py` before anything else.
+
+### B. Mechanisms a user opts into by converting one file
+
+Each is a consequence of the §1 gate: one `.toml` layer routes the whole configuration
+through the lock.
+
+| # | mechanism | what the user sees | warning owed |
+|---|---|---|---|
+| B1 | migration is per configuration, not per file | converting one file routes all layers, including untouched pyconf ones, through the lock | yes -- already recorded as §11.1 |
+| B2 | resolution becomes eager | `ConfigResolutionError` at load instead of at first access. A latent broken reference that never fired now stops the run | yes. This is the reason §10 rejects the universal lock pipeline; the same hazard applies to whoever opts in |
+| B3 | platform collapse | the lock holds one section per product, chosen for this machine. Other platforms' sections are gone from it | yes -- and it is why the lock must never be committed |
+| B4 | a new artifact appears | `<LOCAL.workdir>/.sat/<APPLICATION>.lock.json` | yes, with the `.gitignore` line (see C2) |
+| B5 | staleness is mtime and size based | an edit not reflected in the build, if mtime is unreliable. `--relock` is the escape hatch | yes -- document `--relock` next to the lock, not buried in options |
+| B6 | Python 3.11 floor to author | Rocky 9 ships 3.9, Ubuntu 22.04 ships 3.10: those machines cannot generate a lock, though they can consume one | yes -- and state the asymmetry, because "SAT needs 3.11" is the wrong summary |
+| B7 | configuration becomes unwritable | `sat init --base` against a TOML LOCAL layer refuses, by design | yes -- refusing is the feature, but only if the message says so |
+
+### C. Gaps found while mapping this — not covered by any task
+
+| # | finding | evidence |
+|---|---|---|
+| C1 | **`sat package` regenerates configuration and would emit pyconf for a TOML source.** `commands/package.py` writes `<product>.pyconf` (1400), `local.pyconf` (1468) and the project pyconf (1546) into the archive. A user whose source is TOML would ship a package containing pyconf -- silently converted, by a command with no stated position on the matter | Task 11 enumerates five `__save__` sites; there are **12** outside `pyconf.py` itself. The four in `package.py` and one in `src/logger.py:337` are not among the five |
+| C2 | **`.gitignore` has no entry for the lock.** No `.sat/` and no `*.lock.json`, so B4's artifact appears as untracked in any repository-managed workdir, inviting exactly the commit D6 forbids | `.gitignore`, 10 entries, none matching |
+| C3 | **Every command dumps the full config to a pyconf log.** `src/logger.py:337` writes `<datehour>_<command>.pyconf` on every invocation. For a TOML user that dump is pyconf-formatted and holds resolved values rather than the lazy tree -- harmless, but it is the artifact people paste into bug reports, so its meaning changes | `src/logger.py:330-338` |
+
+C1 is the one that needs a decision rather than a note: emit pyconf and say so, refuse
+as Task 11 refuses, or defer packaging TOML-sourced configurations entirely.
+
+### What must reach users before this ships
+
+Ordered by how expensive the surprise is:
+
+1. **B2, eager resolution** -- the only item that can break a configuration that works today, at the moment of opting in.
+2. **B1, all-or-nothing migration** -- the gap between what was edited and what changed behaviour.
+3. **B3 and B4**, the lock: what it is, where it lives, that it is machine-local, and that it must not be committed.
+4. **B6**, the version floor, stated as authoring-only.
+5. **A3**, that two files naming one layer is an error, with the message quoted so it is recognised when met.
+6. **B5 and B7**, `--relock` and write refusal, as operational notes.
+
+Items A1, A2 and A4 need no user-facing warning by definition: if they are visible,
+they are bugs. They need review attention instead, which is the opposite allocation to
+the list above and worth stating explicitly, since the instinct is to document what was
+hardest to write rather than what is hardest to live with.
+
