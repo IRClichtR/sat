@@ -125,7 +125,7 @@ and loads through `TomlReader`.
 name     = "SALOME-9.12.0-MPI"
 workdir  = "${LOCAL.workdir}${VARS.sep}${APPLICATION.name}-${VARS.dist}"
 tag      = "V9_12_0"
-dev      = "no"
+dev      = "no"      # quoted, never false -- SAT compares == "no" (D10)
 verbose  = "no"
 debug    = "no"
 base     = "no"
@@ -150,10 +150,10 @@ ROOT_SALOME_INSTALL  = "$PRODUCT_ROOT_DIR"
 SALOME_ON_DEMAND     = "HIDE"
 
 [APPLICATION.products]
-Python        = "native"
+Python        = "native"              # pinned version, or "native"
 boost         = "1.58.0"
-CONFIGURATION = {}
-KERNEL        = true
+CONFIGURATION = {}                    # canonical: no overrides, use APPLICATION.tag
+KERNEL        = true                  # accepted alias of {}
 MEDCOUPLING   = { tag = "V9_12_0", section = "default_MPI" }
 mesa          = { tag = "${APPLICATION.tag}" }
 
@@ -165,7 +165,7 @@ name = "SALOME"
 tag  = "SalomeV9"
 
 [APPLICATION.properties]
-mesa_launcher_in_package = "yes"
+mesa_launcher_in_package = "yes"      # properties are yes/no strings too
 git_server               = "tuleap"
 pip                      = "yes"
 pip_install_dir          = "python"
@@ -179,6 +179,25 @@ __condition__              = "VARS.dist in ['FD30']"
 __condition__                = "VARS.dist in ['FD32']"
 "APPLICATION.products.scipy" = "1.5.2"
 ```
+
+**What the reader refuses**, so the file above is the only shape that loads:
+
+```toml
+[APPLICATION]
+debug = false                 # ERROR -- a bool never equals "yes"/"no", so this
+                              #          would silently read as "no" either way
+
+[APPLICATION.products]
+SMESH = false                 # ERROR -- false does not remove a product; membership
+                              #          is by key, so delete the line instead
+
+[[__overwrite__]]
+"APPLICATION.products.SMESH" = false   # ERROR -- same rule, reached by the dotted
+                                       #          key route rather than by nesting
+```
+
+Each raises at load time naming the key, before any configuration is built. The
+reasoning is D10; the ergonomic cost and what would relax it are in §13.
 
 There is no declared schema for these keys yet -- the inventory above is measured from
 the corpus, not enforced by code -- so this snippet is the reference for what a written
@@ -476,3 +495,43 @@ because neither is about pyconf:
   inventory is measured from the corpus rather than declared. Writing that schema down
   is the prerequisite, and it is a larger piece of work than anything above — it is also
   what would let TOML tooling validate a SAT configuration before SAT ever reads it.
+
+---
+
+## 14. Appendix — format correspondence (source material for user documentation)
+
+Not a constraint on the implementation. This is the reference a person converting a
+configuration needs, collected here so that `doc/src/configuration.rst` has something
+to be written from once the feature ships. §11.1 already records that the
+per-configuration migration rule must reach the user documentation; this table is the
+other half of that debt.
+
+Where a row says *resolved*, the lock stores the computed value rather than the
+construct, which is why JSON is an execution artifact and not a source format.
+
+| construct | pyconf | TOML | JSON lock |
+|---|---|---|---|
+| mapping | `k : { ... }` | `[a.b]` or `{ ... }` inline | object |
+| sequence | `k : [ ... ]` | `k = [ ... ]` | array |
+| string | `'v'` or `"v"` | `"v"` | string |
+| bare word value | `TBB` (unquoted) | `"TBB"` — quotes required | string |
+| integer / float | `8080` | `8080` | number |
+| reference | `$VARS.sep` | `"${VARS.sep}"` | **resolved** (`--raw`: template kept) |
+| concatenation | `$a + '-' + $b` | `"${a}-${b}"` | **resolved** |
+| literal `$` | `'$PRODUCT_ROOT_DIR'` | `"$PRODUCT_ROOT_DIR"` — `$` without `{` | string |
+| literal `${` | not expressible | `"$${100}"` | string |
+| comment | `# ...` | `# ...` | **lost** — JSON has none |
+| product, app tag | `KERNEL` (bare key) | `KERNEL = true` or `{}` | `true` or `{}` |
+| product, pinned | `boost : '1.58.0'` | `boost = "1.58.0"` | string |
+| product, overridden | `p : { tag : ... }` | `p = { tag = ... }` | object, `__section__` added (D8) |
+| yes/no flag | `debug : 'no'` | `debug = "no"` — never `false` (D10) | `"no"` |
+| conditional override | `__overwrite__ : [ ... ]` | `[[__overwrite__]]` | **applied**, then absent |
+| platform sections | `default` / `default_win` / … | same | **collapsed** to one (D7) |
+| `@include` | unused in corpus | none | none |
+| backtick eval | unused in corpus | none | none |
+
+Reading it as a migration guide, the rows that cost people time are the ones where
+pyconf allows something TOML does not spell the same way: a bare word value now needs
+quotes, a bare product key becomes `{}` or `true`, a yes/no flag stays a quoted string
+rather than becoming a boolean (§3, D10), and an `__overwrite__` target must be quoted
+so TOML does not nest it. The worked example in §2 shows all four in place.
