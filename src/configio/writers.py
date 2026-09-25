@@ -104,13 +104,22 @@ class JsonWriter(Writer):
                                       a configuration reaches the writer, an
                                       unresolvable reference is a caller bug.
         """
+        failures = []
+        tree = self._convert(cfg, cfg, resolved, "", failures)
+        if failures:
+            # Every failure, not the first. Reporting one at a time turned a
+            # two-bug, 40-application problem in SAT_SALOME into a single
+            # mystery; the cause is only visible once they are side by side.
+            raise PYF.ConfigResolutionError(
+                "%d value(s) could not be resolved:\n%s"
+                % (len(failures), "\n".join(failures)))
+
         # sort_keys stays False: product.py iterates aProd.keys() looking for
         # version-range sections, and a lock should remain diffable against the
         # source it was generated from.
-        json.dump(self._convert(cfg, cfg, resolved), stream,
-                  indent=2, sort_keys=False)
+        json.dump(tree, stream, indent=2, sort_keys=False)
 
-    def _convert(self, node, container, resolved):
+    def _convert(self, node, container, resolved, path="", failures=None):
         """\
         Build the JSON-serialisable form of one configuration node.
 
@@ -121,21 +130,33 @@ class JsonWriter(Writer):
                           references resolve to the wrong value -- silently,
                           in resolved mode.
         :param resolved bool: See write.
+        :param path str: The key path of this node, for failure messages.
+        :param failures list: Accumulator for unresolvable values.
         """
         if isinstance(node, PYF.Mapping):
             data = object.__getattribute__(node, 'data')
-            return dict((key, self._convert(data[key], node, resolved))
+            return dict((key, self._convert(data[key], node, resolved,
+                                            PYF.makePath(path, key), failures))
                         for key in node.keys())
 
         if isinstance(node, PYF.Sequence):
             data = object.__getattribute__(node, 'data')
-            return [self._convert(item, node, resolved) for item in data]
+            return [self._convert(item, node, resolved,
+                                  "%s[%d]" % (path, index), failures)
+                    for index, item in enumerate(data)]
 
         if isinstance(node, (PYF.Reference, PYF.Expression)):
             if not resolved:
                 return str(node)
-            evaluated = container.evaluate(node)
+            try:
+                evaluated = container.evaluate(node)
+            except Exception as error:
+                if failures is None:
+                    raise
+                failures.append("  %s\n    expression: %s\n    %s: %s"
+                                % (path, node, type(error).__name__, error))
+                return None
             # an expression may evaluate to a container, so keep walking
-            return self._convert(evaluated, container, resolved)
+            return self._convert(evaluated, container, resolved, path, failures)
 
         return node

@@ -27,6 +27,8 @@ import pprint as PP
 import src
 import src.logger as LOG
 import src.debug as DBG
+from src.configio.discovery import resolve_layer, layer_is_toml
+from src.configio.readers import reader_for
 import src.callerName as CALN
 
 logger = LOG.getDefaultLogger()
@@ -210,6 +212,25 @@ class ConfigManager:
 
         return var
 
+    def _record_source(self, path):
+        """\
+        Note a configuration file as consumed, for lock staleness.
+
+        The lock is invalidated by any change to any file it was built from, so
+        this has to be called for every layer actually read -- internal, local,
+        projects, application, products and user. A layer missed here makes the
+        lock under-detect staleness, which is the failure task 8 warns about.
+
+        :param path str: The file that was read, or None.
+        """
+        if path is None:
+            return
+        try:
+            stat = os.stat(path)
+        except OSError:
+            return
+        self.sources.append([path, int(stat.st_mtime), stat.st_size])
+
     def get_command_line_overrides(self, options, sections):
         '''get all the overwrites that are in the command line
         
@@ -245,6 +266,11 @@ class ConfigManager:
         :rtype: class 'src.pyconf.Config'
         '''        
         
+        # files consumed, and whether any of them is TOML: the lock is keyed on
+        # the first and gated on the second
+        self.sources = []
+        self.toml_layers = []
+
         # create a ConfigMerger to handle merge
         merger = src.pyconf.ConfigMerger()#MergeHandler())
         
@@ -278,12 +304,14 @@ class ConfigManager:
         src.pyconf.streamOpener = ConfigOpener([
                              osJoin(cfg.VARS.srcDir, 'internal_config')])
         try:
-            if src.architecture.is_windows(): # special internal config for windows
-                internal_cfg = src.pyconf.Config(open( osJoin(cfg.VARS.srcDir,
-                                        'internal_config', 'salomeTools_win.pyconf')))
-            else:
-                internal_cfg = src.pyconf.Config(open( osJoin(cfg.VARS.srcDir,
-                                        'internal_config', 'salomeTools.pyconf')))
+            stem = 'salomeTools_win' if src.architecture.is_windows() \
+                   else 'salomeTools'
+            internal_path, internal_reader = resolve_layer(
+                osJoin(cfg.VARS.srcDir, 'internal_config', stem), [])
+            self._record_source(internal_path)
+            if layer_is_toml(internal_path):
+                self.toml_layers.append(internal_path)
+            internal_cfg = internal_reader.read(internal_path)
         except src.pyconf.ConfigError as e:
             raise src.SatException(_("Error in configuration file:"
                                      " salomeTools.pyconf\n  %(error)s") % \
@@ -300,9 +328,17 @@ class ConfigManager:
         # search only in the data directory
         src.pyconf.streamOpener = ConfigOpener([cfg.VARS.datadir])
         try:
-            local_cfg = src.pyconf.Config(open( osJoin(cfg.VARS.datadir,
-                                                           'local.pyconf')),
-                                         PWD = ('LOCAL', cfg.VARS.datadir) )
+            local_path, local_reader = resolve_layer(
+                osJoin(cfg.VARS.datadir, 'local'), [])
+            if local_path is None:
+                # the IOError the open() call used to raise, caught just below
+                raise IOError("No local.pyconf or local.toml in %s"
+                              % cfg.VARS.datadir)
+            self._record_source(local_path)
+            if layer_is_toml(local_path):
+                self.toml_layers.append(local_path)
+            local_cfg = local_reader.read(local_path,
+                                          pwd=('LOCAL', cfg.VARS.datadir))
         except src.pyconf.ConfigError as e:
             raise src.SatException(_("Error in configuration file: "
                                      "local.pyconf\n  %(error)s") % \
@@ -365,12 +401,19 @@ class ConfigManager:
                         "It will be ignored\n" % project_pyconf_path)
                 sys.stdout.write(msg)
                 continue
-            project_name = os.path.basename(
-                                    project_pyconf_path)[:-len(".pyconf")]
+            # splitext, not [:-len(".pyconf")]: '.toml' is five characters and
+            # slicing by a hardcoded length silently truncates the project name
+            project_name = os.path.splitext(
+                                    os.path.basename(project_pyconf_path))[0]
             try:
                 project_pyconf_dir = os.path.dirname(project_pyconf_path)
-                project_cfg = src.pyconf.Config(open(project_pyconf_path),
-                                                PWD=("", project_pyconf_dir))
+                project_path, project_reader = resolve_layer(
+                    os.path.join(project_pyconf_dir, project_name), [])
+                self._record_source(project_path)
+                if layer_is_toml(project_path):
+                    self.toml_layers.append(project_path)
+                project_cfg = project_reader.read(project_path,
+                                                  pwd=("", project_pyconf_dir))
             except Exception as e:
                 msg = _("ERROR: Error in configuration file: "
                                  "%(file_path)s\n  %(error)s\n") % \
@@ -473,7 +516,16 @@ class ConfigManager:
             src.pyconf.streamOpener = ConfigOpener(cp)
             do_merge = True
             try:
-                application_cfg = src.pyconf.Config(application + '.pyconf')
+                # discovery moves here from pyconf's streamOpener: this site used
+                # to hand a bare name to Config() and let pyconf search
+                # APPLICATIONPATH itself, which no Reader taking a path can do
+                appli_path, appli_reader = resolve_layer(application, cp)
+                if appli_path is None:
+                    raise IOError(_("Application %s not found") % application)
+                self._record_source(appli_path)
+                if layer_is_toml(appli_path):
+                    self.toml_layers.append(appli_path)
+                application_cfg = appli_reader.read(appli_path)
             except IOError as e:
                 raise src.SatException(
                    _("%s, use 'config --list' to get the list of available applications.") % e)
@@ -521,8 +573,8 @@ class ConfigManager:
             for product_name in application_cfg.APPLICATION.products.keys():
                 # Loop on all files that are in softsDir directory
                 # and read their config
-                product_file_name = product_name + ".pyconf"
-                product_file_path = src.find_file_in_lpath(product_file_name, cfg.PATHS.PRODUCTPATH)
+                product_file_path, product_reader = resolve_layer(
+                    product_name, cfg.PATHS.PRODUCTPATH)
                 if product_file_path:
                     products_dir = os.path.dirname(product_file_path)
                     # for a relative path (archive case) we complete with sat path
@@ -530,8 +582,11 @@ class ConfigManager:
                         products_dir = os.path.join(cfg.VARS.salometoolsway,
                                                     products_dir)
                     try:
-                        prod_cfg = src.pyconf.Config(open(product_file_path),
-                                                     PWD=("", products_dir))
+                        self._record_source(product_file_path)
+                        if layer_is_toml(product_file_path):
+                            self.toml_layers.append(product_file_path)
+                        prod_cfg = product_reader.read(product_file_path,
+                                                       pwd=("", products_dir))
                         prod_cfg.from_file = product_file_path
                         products_cfg.PRODUCTS[product_name] = prod_cfg
                     except Exception as e:
@@ -565,7 +620,14 @@ class ConfigManager:
         # load USER config
         self.set_user_config_file(cfg)
         user_cfg_file = self.get_user_config_file()
-        user_cfg = src.pyconf.Config(open(user_cfg_file))
+        user_path, user_reader = resolve_layer(
+            os.path.splitext(user_cfg_file)[0], [])
+        if user_path is None:
+            user_path, user_reader = user_cfg_file, reader_for(user_cfg_file)
+        self._record_source(user_path)
+        if layer_is_toml(user_path):
+            self.toml_layers.append(user_path)
+        user_cfg = user_reader.read(user_path)
         merger.merge(cfg, user_cfg)
 
         # apply overwrite from command line if needed

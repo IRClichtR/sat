@@ -123,7 +123,7 @@ def lock_path(cfg):
     return os.path.join(workdir, LOCK_DIR, "%s.lock.json" % name)
 
 
-def write_lock(cfg, path, sources):
+def write_lock(cfg, path, sources, overrides=None):
     """\
     Serialise a collapsed configuration, with the header that invalidates it.
 
@@ -135,6 +135,11 @@ def write_lock(cfg, path, sources):
     :param sources list: One [path, mtime, size] per file consumed, for every
                          layer -- application, products, projects, local,
                          internal and user.
+    :param overrides list: The command-line -o rules that were applied. They
+                           change the configuration without changing any file,
+                           so a lock that ignored them could be served to an
+                           invocation that asked for something different --
+                           the tuleap/github case in Task 10.
     """
     directory = os.path.dirname(path)
     if directory and not os.path.isdir(directory):
@@ -155,6 +160,12 @@ def write_lock(cfg, path, sources):
         sequence.append(item, None)
     header.addMapping("sources", sequence, None, setting=True)
 
+    rules = PYF.Sequence(header)
+    rules.setPath(PYF.makePath(LOCK_KEY, "overrides"))
+    for rule in sorted(overrides or []):
+        rules.append(rule, None)
+    header.addMapping("overrides", rules, None, setting=True)
+
     cfg[LOCK_KEY] = header
     with open(path, "w") as stream:
         JsonWriter().write(cfg, stream, resolved=True)
@@ -171,7 +182,7 @@ def read_lock(path):
     return JsonReader().read(path)
 
 
-def is_stale(path, sources, cfg):
+def is_stale(path, sources, cfg, overrides=None):
     """\
     Whether a lock must be regenerated before it can be trusted.
 
@@ -185,6 +196,7 @@ def is_stale(path, sources, cfg):
     :param path str: The lock to check.
     :param sources list: [path, mtime, size] per source file, as they are now.
     :param cfg: The configuration about to be built.
+    :param overrides list: The command-line -o rules for this invocation.
     :rtype: bool
     """
     if not os.path.isfile(path):
@@ -204,6 +216,9 @@ def is_stale(path, sources, cfg):
     if header.get("dist") != _lookup(cfg, "VARS", "dist"):
         return True
     if header.get("application") != _lookup(cfg, "APPLICATION", "name"):
+        return True
+
+    if sorted(header.get("overrides") or []) != sorted(overrides or []):
         return True
 
     recorded = header.get("sources")

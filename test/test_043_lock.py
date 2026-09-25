@@ -168,6 +168,57 @@ class TestStaleness(LockTestCase):
         self.assertTrue(is_stale(self.lock, self.sources(), self.cfg()))
 
 
+class TestOverridesInTheKey(LockTestCase):
+    """\
+    Command-line overrides change the configuration without changing a file.
+
+    SALOME is hosted on CEA Tuleap and on GitHub; all 61 application files that
+    name a server default to 'tuleap', and the public workflow overrides it with
+    -o "APPLICATION.properties.git_server='github'" on every command. Two
+    populations, identical files. A lock that ignores overrides can be served to
+    an invocation that asked for the other one.
+    """
+
+    def test_overrides_are_recorded_in_the_header(self):
+        write_lock(self.cfg(), self.lock, self.sources(),
+                   overrides=["APPLICATION.properties.git_server='github'"])
+        header = read_lock(self.lock)[LOCK_KEY]
+        self.assertIn("git_server", str(header.overrides))
+
+    def test_no_overrides_records_an_empty_list(self):
+        write_lock(self.cfg(), self.lock, self.sources())
+        self.assertIn("overrides", read_lock(self.lock)[LOCK_KEY])
+
+    def test_the_same_overrides_are_not_stale(self):
+        rules = ["APPLICATION.properties.git_server='github'"]
+        write_lock(self.cfg(), self.lock, self.sources(), overrides=rules)
+        self.assertFalse(is_stale(self.lock, self.sources(), self.cfg(),
+                                 overrides=rules))
+
+    def test_a_different_override_value_is_stale(self):
+        write_lock(self.cfg(), self.lock, self.sources(),
+                   overrides=["APPLICATION.properties.git_server='github'"])
+        self.assertTrue(is_stale(self.lock, self.sources(), self.cfg(),
+                                 overrides=["APPLICATION.properties.git_server='tuleap'"]))
+
+    def test_losing_an_override_is_stale(self):
+        # the public user who forgets the -o on one command out of eleven
+        write_lock(self.cfg(), self.lock, self.sources(),
+                   overrides=["APPLICATION.properties.git_server='github'"])
+        self.assertTrue(is_stale(self.lock, self.sources(), self.cfg()))
+
+    def test_gaining_an_override_is_stale(self):
+        write_lock(self.cfg(), self.lock, self.sources())
+        self.assertTrue(is_stale(self.lock, self.sources(), self.cfg(),
+                                 overrides=["APPLICATION.debug='yes'"]))
+
+    def test_override_order_does_not_matter(self):
+        a = ["APPLICATION.debug='yes'", "APPLICATION.verbose='no'"]
+        write_lock(self.cfg(), self.lock, self.sources(), overrides=a)
+        self.assertFalse(is_stale(self.lock, self.sources(), self.cfg(),
+                                 overrides=list(reversed(a))))
+
+
 class TestCollapse(unittest.TestCase):
     """The winning section is chosen by SAT's own code, then stored flat."""
 

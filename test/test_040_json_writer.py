@@ -99,6 +99,53 @@ class TestResolvedMode(unittest.TestCase):
             dump(cfg)
 
 
+class TestFailureReporting(unittest.TestCase):
+    """\
+    Every unresolvable value at once, not the first one.
+
+    Dying on the first failure is what made a two-bug, 40-application problem in
+    SAT_SALOME look like a single mystery (spec section 16).
+    """
+
+    def broken(self, count):
+        cfg = PYF.Config()
+        cfg.addMapping("A", PYF.Mapping(cfg), "")
+        for index in range(count):
+            cfg.A["k%d" % index] = PYF.Reference(cfg, PYF.DOLLAR,
+                                                 "nowhere%d" % index)
+        return cfg
+
+    def test_one_failure_still_raises(self):
+        with self.assertRaises(PYF.ConfigResolutionError):
+            dump(self.broken(1))
+
+    def test_every_failure_is_reported_not_just_the_first(self):
+        with self.assertRaises(PYF.ConfigResolutionError) as caught:
+            dump(self.broken(3))
+        message = str(caught.exception)
+        for index in range(3):
+            self.assertIn("A.k%d" % index, message)
+
+    def test_the_message_names_the_key_path_and_the_expression(self):
+        cfg = PYF.Config()
+        cfg.addMapping("A", PYF.Mapping(cfg), "")
+        cfg.A["x"] = PYF.Expression(PYF.PLUS, "prefix-",
+                                    PYF.Reference(cfg, PYF.DOLLAR, "nowhere"))
+        with self.assertRaises(PYF.ConfigResolutionError) as caught:
+            dump(cfg)
+        message = str(caught.exception)
+        self.assertIn("A.x", message)
+        self.assertIn("nowhere", message)
+
+    def test_the_count_is_stated(self):
+        with self.assertRaises(PYF.ConfigResolutionError) as caught:
+            dump(self.broken(4))
+        self.assertIn("4", str(caught.exception))
+
+    def test_raw_mode_reports_nothing_because_it_resolves_nothing(self):
+        dump(self.broken(3), resolved=False)   # must not raise
+
+
 class TestRawMode(unittest.TestCase):
     """The diagnostic: what did the author actually write?"""
 
