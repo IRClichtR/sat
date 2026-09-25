@@ -1,0 +1,307 @@
+#!/usr/bin/env python
+#-*- coding:utf-8 -*-
+
+#  Copyright (C) 2010-2018  CEA/DEN
+#
+#  This library is free software; you can redistribute it and/or
+#  modify it under the terms of the GNU Lesser General Public
+#  License as published by the Free Software Foundation; either
+#  version 2.1 of the License.
+#
+#  This library is distributed in the hope that it will be useful,
+#  but WITHOUT ANY WARRANTY; without even the implied warranty of
+#  MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
+#  Lesser General Public License for more details.
+#
+#  You should have received a copy of the GNU Lesser General Public
+#  License along with this library; if not, write to the Free Software
+#  Foundation, Inc., 59 Temple Place, Suite 330, Boston, MA  02111-1307 USA
+
+"""\
+Unit tests for src.configio.lock.
+
+Three concerns, kept apart: collapsing a product to its winning section,
+persisting the result, and deciding when the result has gone stale. The
+collapse must happen before serialisation -- that ordering is what stops a
+platform-dead reference from being evaluated.
+"""
+
+import io
+import os
+import shutil
+import tempfile
+import unittest
+
+import initializeTest  # noqa: F401  -- must be first, sets sys.path
+import src.pyconf as PYF
+from src.configio.lock import (collapse_products, lock_path, write_lock,
+                               read_lock, is_stale, SECTION_KEY, LOCK_KEY)
+
+
+class LockTestCase(unittest.TestCase):
+    """Base class providing a scratch tree and a trivial source file."""
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp(prefix="sat_lock_")
+        self.src = os.path.join(self.tmp, "src.toml")
+        with open(self.src, "w") as stream:
+            stream.write('x = 1\n')
+        self.lock = os.path.join(self.tmp, "a.lock.json")
+
+    def tearDown(self):
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def cfg(self):
+        """A minimal config carrying the keys the lock header looks for."""
+        cfg = PYF.Config()
+        cfg.addMapping("A", PYF.Mapping(cfg), "")
+        cfg.A["name"] = "MYAPP"
+        cfg.addMapping("VARS", PYF.Mapping(cfg), "")
+        cfg.VARS["dist"] = "UB24.04"
+        cfg.addMapping("APPLICATION", PYF.Mapping(cfg), "")
+        cfg.APPLICATION["name"] = "MYAPP"
+        return cfg
+
+    def sources(self, *extra):
+        entries = []
+        for path in (self.src,) + extra:
+            stat = os.stat(path)
+            entries.append([path, int(stat.st_mtime), stat.st_size])
+        return entries
+
+
+class TestPersistence(LockTestCase):
+    """write_lock and read_lock are two halves of one property."""
+
+    def test_lock_roundtrips_through_disk(self):
+        write_lock(self.cfg(), self.lock, self.sources())
+        self.assertEqual(read_lock(self.lock).A.name, "MYAPP")
+
+    def test_the_header_records_the_sources(self):
+        write_lock(self.cfg(), self.lock, self.sources())
+        self.assertIn(self.src, str(read_lock(self.lock)[LOCK_KEY]))
+
+    def test_the_header_records_the_invalidating_facts(self):
+        write_lock(self.cfg(), self.lock, self.sources())
+        header = read_lock(self.lock)[LOCK_KEY]
+        self.assertEqual(header.dist, "UB24.04")
+        self.assertEqual(header.application, "MYAPP")
+        self.assertIn("sat_version", header)
+
+    def test_it_creates_the_containing_directory(self):
+        deep = os.path.join(self.tmp, ".sat", "nested", "a.lock.json")
+        write_lock(self.cfg(), deep, self.sources())
+        self.assertTrue(os.path.isfile(deep))
+
+    def test_read_lock_returns_a_real_Config(self):
+        write_lock(self.cfg(), self.lock, self.sources())
+        self.assertIsInstance(read_lock(self.lock), PYF.Config)
+
+    def test_lock_path_is_under_the_workdir(self):
+        cfg = self.cfg()
+        cfg.addMapping("LOCAL", PYF.Mapping(cfg), "")
+        cfg.LOCAL["workdir"] = os.path.join(self.tmp, "work")
+        path = lock_path(cfg)
+        self.assertTrue(path.startswith(os.path.join(self.tmp, "work")))
+        self.assertIn(".sat", path)
+        self.assertTrue(path.endswith("MYAPP.lock.json"))
+
+
+class TestStaleness(LockTestCase):
+    """A lock is a cache, so this is the part that actually matters."""
+
+    def test_a_fresh_lock_is_not_stale(self):
+        write_lock(self.cfg(), self.lock, self.sources())
+        self.assertFalse(is_stale(self.lock, self.sources(), self.cfg()))
+
+    def test_a_missing_lock_is_stale(self):
+        self.assertTrue(is_stale(self.lock, self.sources(), self.cfg()))
+
+    def test_an_edited_source_makes_it_stale(self):
+        write_lock(self.cfg(), self.lock, self.sources())
+        with open(self.src, "w") as stream:
+            stream.write('x = 2\nyyyy = 3\n')      # mtime and size both change
+        self.assertTrue(is_stale(self.lock, self.sources(), self.cfg()))
+
+    def test_a_source_of_the_same_size_at_a_new_time_makes_it_stale(self):
+        write_lock(self.cfg(), self.lock, self.sources())
+        os.utime(self.src, (0, 0))
+        self.assertTrue(is_stale(self.lock, self.sources(), self.cfg()))
+
+    def test_a_new_source_file_makes_it_stale(self):
+        write_lock(self.cfg(), self.lock, self.sources())
+        extra = os.path.join(self.tmp, "extra.toml")
+        with open(extra, "w") as stream:
+            stream.write('y = 1\n')
+        self.assertTrue(is_stale(self.lock, self.sources(extra), self.cfg()))
+
+    def test_a_removed_source_file_makes_it_stale(self):
+        extra = os.path.join(self.tmp, "extra.toml")
+        with open(extra, "w") as stream:
+            stream.write('y = 1\n')
+        write_lock(self.cfg(), self.lock, self.sources(extra))
+        os.remove(extra)
+        self.assertTrue(is_stale(self.lock, self.sources(), self.cfg()))
+
+    def test_a_different_platform_makes_it_stale(self):
+        write_lock(self.cfg(), self.lock, self.sources())
+        other = self.cfg()
+        other.VARS["dist"] = "CO9"
+        self.assertTrue(is_stale(self.lock, self.sources(), other))
+
+    def test_a_different_application_makes_it_stale(self):
+        write_lock(self.cfg(), self.lock, self.sources())
+        other = self.cfg()
+        other.APPLICATION["name"] = "OTHERAPP"
+        self.assertTrue(is_stale(self.lock, self.sources(), other))
+
+    def test_an_unreadable_lock_is_stale_rather_than_fatal(self):
+        # conservative by design: regenerating costs a second, using a stale
+        # lock costs an afternoon
+        with open(self.lock, "w") as stream:
+            stream.write("{not json")
+        self.assertTrue(is_stale(self.lock, self.sources(), self.cfg()))
+
+    def test_a_lock_without_a_header_is_stale(self):
+        with open(self.lock, "w") as stream:
+            stream.write('{"A": {"name": "MYAPP"}}')
+        self.assertTrue(is_stale(self.lock, self.sources(), self.cfg()))
+
+
+class TestCollapse(unittest.TestCase):
+    """The winning section is chosen by SAT's own code, then stored flat."""
+
+    def build(self, products_entry="'1_71_0'", incremental=False):
+        """\
+        A config shaped the way get_product_section expects.
+
+        PRODUCTS.boost carries three sections: default, version_1_71_0 and
+        default_win. Only one may survive a collapse on Linux.
+        """
+        text = '''
+APPLICATION :
+{
+    name : 'MYAPP'
+    tag : 'master'
+    products : { boost : %s }
+}
+PRODUCTS :
+{
+    boost :
+    {
+        # get_config sets this on every product file it loads
+        # (commands/config.py:535), and get_product_section reads it
+        from_file : '/fake/products/boost.pyconf'
+        default :
+        {
+            name : 'boost'
+            build_source : 'script'
+            %s
+        }
+        version_1_71_0 :
+        {
+            name : 'boost'
+            build_source : 'cmake'
+        }
+        default_win :
+        {
+            name : 'boost'
+            compil_script : 'boost.bat'
+        }
+    }
+}
+''' % (products_entry,
+       'properties : { incremental : "yes" }' if incremental else '')
+        return PYF.Config(io.StringIO(text))
+
+    def test_the_winning_section_is_recorded(self):
+        cfg = self.build()
+        collapse_products(cfg)
+        self.assertEqual(cfg.PRODUCTS.boost[SECTION_KEY], "version_1_71_0")
+
+    def test_the_winning_sections_contents_are_flattened_in(self):
+        cfg = self.build()
+        collapse_products(cfg)
+        self.assertEqual(cfg.PRODUCTS.boost.build_source, "cmake")
+
+    def test_the_losing_sections_are_gone(self):
+        cfg = self.build()
+        collapse_products(cfg)
+        keys = cfg.PRODUCTS.boost.keys()
+        self.assertNotIn("default", keys)
+        self.assertNotIn("version_1_71_0", keys)
+
+    def test_default_win_is_dropped_on_linux(self):
+        # the whole point of collapsing before serialising: this section holds
+        # references that are inert here and must never be evaluated
+        cfg = self.build()
+        collapse_products(cfg)
+        self.assertNotIn("default_win", cfg.PRODUCTS.boost.keys())
+        self.assertNotIn("compil_script", cfg.PRODUCTS.boost.keys())
+
+    def test_a_product_falling_back_to_default_records_default(self):
+        cfg = self.build(products_entry="'9_9_9'")
+        collapse_products(cfg)
+        self.assertEqual(cfg.PRODUCTS.boost[SECTION_KEY], "default")
+        self.assertEqual(cfg.PRODUCTS.boost.build_source, "script")
+
+    def test_an_explicit_section_override_is_honoured(self):
+        cfg = self.build(products_entry="{ tag : '1_71_0', section : 'default' }")
+        collapse_products(cfg)
+        self.assertEqual(cfg.PRODUCTS.boost[SECTION_KEY], "default")
+
+    def test_a_bare_product_entry_uses_the_application_tag(self):
+        cfg = self.build(products_entry="'master'")
+        collapse_products(cfg)
+        self.assertIn(SECTION_KEY, cfg.PRODUCTS.boost.keys())
+
+    def test_a_dotted_version_still_matches_its_section(self):
+        # get_product_config substitutes ".-/" with "_" before calling
+        # get_product_section (src/product.py:168), because pyconf cannot use
+        # those characters in a key. Passing the version raw makes
+        # "version_1.71.0" miss version_1_71_0 and fall through to default --
+        # a product silently built from the wrong section.
+        cfg = self.build(products_entry="'1.71.0'")
+        collapse_products(cfg)
+        self.assertEqual(cfg.PRODUCTS.boost[SECTION_KEY], "version_1_71_0")
+        self.assertEqual(cfg.PRODUCTS.boost.build_source, "cmake")
+
+    def test_a_dashed_version_is_normalised_too(self):
+        cfg = self.build(products_entry="'1-71-0'")
+        collapse_products(cfg)
+        self.assertEqual(cfg.PRODUCTS.boost[SECTION_KEY], "version_1_71_0")
+
+    def test_an_incremental_product_keeps_the_layered_result(self):
+        # get_product_section layers default then the winning section, and it
+        # does so by mutating default in place -- so collapse must read the
+        # result once and replace the product wholesale
+        cfg = self.build(incremental=True)
+        collapse_products(cfg)
+        self.assertEqual(cfg.PRODUCTS.boost[SECTION_KEY], "version_1_71_0")
+        self.assertEqual(cfg.PRODUCTS.boost.build_source, "cmake")
+
+    def test_collapsing_twice_is_idempotent(self):
+        cfg = self.build(incremental=True)
+        collapse_products(cfg)
+        first = dict((k, cfg.PRODUCTS.boost[k])
+                     for k in cfg.PRODUCTS.boost.keys())
+        collapse_products(cfg)
+        second = dict((k, cfg.PRODUCTS.boost[k])
+                      for k in cfg.PRODUCTS.boost.keys())
+        self.assertEqual(first, second)
+
+    def test_a_config_without_products_is_left_alone(self):
+        cfg = PYF.Config()
+        cfg.addMapping("A", PYF.Mapping(cfg), "")
+        collapse_products(cfg)          # must not raise
+        self.assertEqual(list(cfg.keys()), ["A"])
+
+    def test_the_parent_chain_survives_the_replacement(self):
+        cfg = self.build()
+        collapse_products(cfg)
+        self.assertIs(object.__getattribute__(cfg.PRODUCTS.boost, 'parent'),
+                      cfg.PRODUCTS)
+
+
+if __name__ == '__main__':
+    unittest.main()

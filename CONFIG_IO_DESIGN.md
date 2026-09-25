@@ -576,12 +576,12 @@ through the lock.
 | B6 | Python 3.11 floor to author | Rocky 9 ships 3.9, Ubuntu 22.04 ships 3.10: those machines cannot generate a lock, though they can consume one | yes -- and state the asymmetry, because "SAT needs 3.11" is the wrong summary |
 | B7 | configuration becomes unwritable | `sat init --base` against a TOML LOCAL layer refuses, by design | yes -- refusing is the feature, but only if the message says so |
 
-### C. Gaps found while mapping this — not covered by any task
+### C. Gaps found while mapping this — one planned, two not
 
 | # | finding | evidence |
 |---|---|---|
 | C1 | **`sat package` regenerates configuration and would emit pyconf for a TOML source.** `commands/package.py` writes `<product>.pyconf` (1400), `local.pyconf` (1468) and the project pyconf (1546) into the archive. A user whose source is TOML would ship a package containing pyconf -- silently converted, by a command with no stated position on the matter | Task 11 enumerates five `__save__` sites; there are **12** outside `pyconf.py` itself. The four in `package.py` and one in `src/logger.py:337` are not among the five |
-| C2 | **`.gitignore` has no entry for the lock.** No `.sat/` and no `*.lock.json`, so B4's artifact appears as untracked in any repository-managed workdir, inviting exactly the commit D6 forbids | `.gitignore`, 10 entries, none matching |
+| C2 | ~~`.gitignore` has no entry for the lock~~ -- **already planned.** Task 8 step 6 adds `*.lock.json` and `.sat/`. Listed here only because it was missed on a first pass and the artifact is the one D6 forbids committing | `plan/08-lock.md`, step 6 |
 | C3 | **Every command dumps the full config to a pyconf log.** `src/logger.py:337` writes `<datehour>_<command>.pyconf` on every invocation. For a TOML user that dump is pyconf-formatted and holds resolved values rather than the lazy tree -- harmless, but it is the artifact people paste into bug reports, so its meaning changes | `src/logger.py:330-338` |
 
 C1 is the one that needs a decision rather than a note: emit pyconf and say so, refuse

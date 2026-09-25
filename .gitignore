@@ -21,3 +21,8 @@ __pycache__/
 
 # IDE/editors/tools cache files
 .vscode/
+
+# JSON lock files
+*.lock.json
+# generated, machine-local lock directory
+.sat/
