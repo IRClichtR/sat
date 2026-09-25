@@ -23,11 +23,13 @@ relative to the product notion of salomeTools
 
 import os
 import re
+import difflib
 import pprint as PP
 
 import src
 import src.debug as DBG
 import src.versionMinorMajorPatch as VMMP
+from src.configio.lock import SECTION_KEY
 
 AVAILABLE_VCS = ['git', 'svn', 'cvs']
 
@@ -161,16 +163,26 @@ def get_product_config(config, product_name, with_install_dir=True):
         if 'section' in dic_version:
             section = dic_version['section']
 
-    vv = version
-    # substitute some character with _ in order to get the correct definition
-    # in config.PRODUCTS. This is done because the pyconf tool does not handle
-    # the . and - characters
-    for c in ".-/": vv = vv.replace(c, "_")
-
     prod_info = None
     if product_name in config.PRODUCTS:
-        # Search for the product description in the configuration
-        prod_info = get_product_section(config, product_name, vv, section)
+        if SECTION_KEY in config.PRODUCTS[product_name]:
+            # The configuration came from a lock: collapse_products already
+            # chose this product's section and recorded which one. Re-deciding
+            # it here would be a second implementation of the same choice,
+            # agreeing by luck until the day it did not -- at which point the
+            # artifact meant to make builds reproducible makes them mysterious.
+            # from_file is already in the block, copied there by the collapse.
+            prod_info = config.PRODUCTS[product_name]
+            prod_info.section = prod_info[SECTION_KEY]
+        else:
+            vv = version
+            # substitute some character with _ in order to get the correct definition
+            # in config.PRODUCTS. This is done because the pyconf tool does not handle
+            # the . and - characters
+            for c in ".-/": vv = vv.replace(c, "_")
+
+            # Search for the product description in the configuration
+            prod_info = get_product_section(config, product_name, vv, section)
 
         # get salomeTool version
         prod_info.sat_version = src.get_salometool_version(config)
@@ -427,7 +439,27 @@ def get_product_section(config, product_name, version, section=None):
     # if a section is explicitely specified we select it
     if section:
         if section not in aProd:
-            pi=None
+            # A section named explicitly by the application either exists or the
+            # application is wrong; there is no sensible fallback. Setting
+            # pi=None here and carrying on -- which is what this did -- gave an
+            # AttributeError on the next line for a plain product, and silently
+            # used 'default' for an incremental one, ignoring what was asked.
+            # only real sections: from_file and PWD are bookkeeping keys
+            available = [k for k in aProd.keys()
+                         if isinstance(aProd[k], src.pyconf.Mapping)]
+            # a product may define dozens of sections, so hint rather than dump
+            hint = difflib.get_close_matches(section, available, n=5, cutoff=0.4)
+            raise src.SatException(
+                _("""\
+The section %(section)s requested for the product %(product)s does not exist.
+  file: %(file)s
+  closest defined sections: %(hint)s
+  (%(count)s sections defined in total)""") % {
+                    "section": section,
+                    "product": product_name,
+                    "file": aProd.from_file if "from_file" in aProd else "?",
+                    "hint": ", ".join(hint) if hint else ", ".join(available[:5]),
+                    "count": len(available) })
         # returns specific information for the given version
         pi = aProd[section]
         pi.section = section
