@@ -215,6 +215,48 @@ file should look like until one exists.
 | `VTK_SMP_IMPLEMENTATION_TYPE` | `"TBB"` was a bare unquoted `TBB` in pyconf. TOML forces the quotes, which removes a real ambiguity. |
 | `[[__overwrite__]]` | an array of tables. The assignment keys **must stay quoted** -- unquoted, `APPLICATION.products.gcc` would nest into three tables instead of naming one key (§2, consequence 3). |
 
+### What the lock costs and saves, measured
+
+Every SAT command rebuilds the whole configuration from scratch
+(`src/salomeTools.py:430`), including sub-commands invoked through the runner API. The
+lock therefore replaces a repeated 461-file parse with a single JSON read.
+
+On `MEDCOUPLING-9.12.0`, 42 products:
+
+| operation | time | lock size |
+|---|---|---|
+| full `get_config` from pyconf | 0.081 s | — |
+| `read_lock`, one JSON file | **0.002 s** | 51 KB |
+| | **39x faster** | |
+
+On `SALOME-9.12.0-MPI`, 148 products, the product layer alone parses in 0.278 s, and
+`collapse_products` adds 0.005 s.
+
+The figure that matters is not one command but a delegating one. `sat prepare`
+(`commands/prepare.py:176-200`) calls `get_products_list` itself and then invokes
+`clean`, `source` and `patch` through the API — **four full configuration builds for one
+user action**:
+
+| | `sat prepare` |
+|---|---|
+| today, pyconf | 0.32 s |
+| via the lock | **0.01 s** |
+
+Two conclusions follow, and they shape §8's integration rather than merely justifying it.
+
+**The lock must be a file, not an in-memory cache.** Each sub-command is a separate
+rebuild, so nothing held in process survives to the next one.
+
+**`is_stale` runs four times per `sat prepare`**, which is why it compares mtime and size
+rather than hashing 294 product files — the check has to be cheaper than the work it
+avoids, four times over.
+
+It also means **removing the four rebuilds is not the fix**. Passing one configuration
+down from `prepare` to its delegates would save ~10 ms once the lock exists, while
+introducing a re-entrancy requirement nothing in SAT has today: `get_product_section`
+mutates the tree for incremental products, so the second command would see the first
+command's overlay. Making repeated work cheap beats making the control flow cleverer.
+
 ### Premise correction
 
 The source prompt states TOML has "interpolation of variables". It does not —
@@ -232,7 +274,7 @@ top as a string convention we parse ourselves (§4).
 | D3 | TOML is accepted at **all six layers** (INTERNAL, LOCAL, PROJECTS, APPLICATION, PRODUCTS, USER) | Uniform; no rule about where TOML is allowed |
 | D4 | Both `X.pyconf` and `X.toml` for one layer is a **fatal error** naming both paths. SAT **refuses to write** a TOML-sourced layer | Silent precedence is exactly how two files drift apart unnoticed — the "double parsing" pitfall from the prompt |
 | D5 | Parser is stdlib `tomllib` only. Python < 3.11 raises a clear error pointing at `.pyconf` | Zero dependencies; no parser code we own |
-| D6 | The lock is **machine-local and gitignored**, fully resolved | A resolved SAT config contains absolute paths, distro tag and user name — it is not portable, so it must not pretend to be |
+| D6 | The lock is **machine-local and gitignored**, fully resolved (— *"fully" is contingent on §16*) | A resolved SAT config contains absolute paths, distro tag and user name — it is not portable, so it must not pretend to be |
 | D7 | The lock is **platform-evaluated**: products are collapsed to their single applicable section, other platforms discarded | See §5 — this is what removes the eager-resolution hazard |
 | D8 | Collapsed products are stored **flat with a `__section__` marker**; `get_product_config` gains an early branch to use them verbatim | The platform decision is made exactly once, so runtime cannot diverge from the lock |
 | D9 | `src/pyconf.py` is **not modified** | Hard constraint from the prompt |
@@ -603,3 +645,172 @@ they are bugs. They need review attention instead, which is the opposite allocat
 the list above and worth stating explicitly, since the instinct is to document what was
 hardest to write rather than what is hardest to live with.
 
+
+---
+
+## 16. Open decision — eager resolution cannot complete
+
+**Status: DECIDED — option 2. Implemented in Task 8; `collapse_products` calls
+`get_product_config`. See "Outcome" at the end of this section.**
+
+### What happens
+
+Building a real configuration with the real `get_config`, collapsing it, then writing it
+with `JsonWriter(resolved=True)`:
+
+| application | products | result |
+|---|---|---|
+| `MEDCOUPLING-9.12.0` | 42 | succeeds — 51 KB lock |
+| `SALOME-9.12.0-MPI` | 148 | **fails** |
+
+```
+ConfigResolutionError: unable to evaluate $install_dir
+in the configuration default.environ
+```
+
+### Why it is structural, not a bug
+
+`install_dir` appears in no product file. `get_product_config` computes it by calling
+`get_install_dir` at runtime and attaches it to the product info it returns. A product
+whose `environ` block references `$install_dir` therefore holds a reference that resolves
+only *after* runtime derivation — while the writer runs before it, by construction.
+
+| reference | occurrences | files | resolvable at lock time |
+|---|---|---|---|
+| `$install_dir` | **521** | **33** | **no** — attached by `get_install_dir` at runtime |
+| `$name` | 1114 | 274 | yes — `name` is a key in the section |
+
+Collapsing does not help: this is not a platform-dead section (§5) nor a latent broken
+reference (§15 B2). It is a reference into a value that does not exist yet, by design.
+
+Worth noting how it was nearly missed: `MEDCOUPLING-9.12.0` contains none of those 33
+products, so it locks cleanly. Validating against one application would have shipped it.
+
+### The options
+
+| # | option | what changes | cost |
+|---|---|---|---|
+| **1** | **Partial lock.** Leave `environ` blocks unresolved in the lock; `environment.py` resolves them at runtime as it does today | §4, §7; Task 5 gains a per-region mode; Task 6 must revive pyconf `$`-syntax inside those regions | The lock stops being uniformly resolved, so it has two modes in one document. Directly reverses Task 6's rule that `JsonReader` parses no templates — a rule that exists to stop a raw dump being loaded as an execution input. The "bash and jq can read it" motivation (§10) weakens wherever a value is still a template |
+| **2** | **Derive `install_dir` during collapse.** `collapse_products` calls `get_install_dir` and stores the result, so `$install_dir` resolves like any other key | D6, D8, §10; Task 8's `collapse_products` | Pulls one derived value into the lock, which §10 rejected for `get_product_config`'s output as a whole. That rejection was about **duplicating ~300 lines**; *calling* the existing function is not duplication — it is the same principle Task 8 already applies to `get_product_section`. `is_stale` gains a new reason to invalidate, since `install_dir` depends on `base` and `install_mode`, which can change with no source file changing |
+| **3** | **Exclude affected products.** Products with runtime-only references are not locked and fall back to the pyconf path | §1, D6 | Breaks the model: the lock is no longer the artifact SAT executes against, and a configuration is half locked. Rejected unless 1 and 2 both prove worse |
+| **4** | **Resolve nothing; lock raw only.** The lock becomes a normalised source cache, not an execution artifact | §1, §7, D2, D6 | Abandons the `Cargo.lock` model the feature is built on, and the eager-resolution benefit with it. Listed for completeness |
+
+### Recommendation
+
+**Option 2.** It keeps one representation, one resolution pass, and one implementation of
+the install-directory decision. The drift §10 feared comes from reimplementing a
+decision, not from invoking it — and Task 8 already establishes invoking as the pattern.
+Option 1 is the alternative worth taking seriously if pulling derived values into the
+lock proves to cascade: the moment `install_dir` is in there, the next reviewer will ask
+why `source_dir` and `build_dir` are not.
+
+The deciding question is narrow enough to state: **is `install_dir` part of the decision
+the lock records, or part of the work the lock feeds?** Option 2 says the former, option 1
+the latter. Nothing else in this document answers it.
+
+### Outcome
+
+Option 2 was taken. `collapse_products` calls `get_product_config` rather than
+`get_product_section`, so the lock stores the product info SAT actually derived --
+`install_dir`, `install_mode` and the rest -- and `$install_dir` resolves like any other
+key. One call, no reimplementation, the same principle Task 8 already applies to section
+selection.
+
+`get_product_config` keeps `install_dir_save` bookkeeping for repeat calls, so a second
+collapse adds that one key while every value stays identical. That is pinned by
+`test_collapsing_twice_changes_no_value`.
+
+**The `$install_dir` failure class is gone.** Locking all 162 applications:
+
+| | applications |
+|---|---|
+| lock cleanly | **116** |
+| fail | **46** |
+
+The 46 fall into three classes. **Two are genuine upstream configuration bugs; the third
+is an artifact of the measurement** and is not a bug at all:
+
+| apps | failure | verdict |
+|---|---|---|
+| 36 | `TypeError: can only concatenate str (not "bool") to str` | **bug** — see U1 below |
+| 4 | `AttributeError: Unknown pyconf key: 'version_6_1_0_MPI'` | **bug** — see U2 below |
+| 6 | `SatException: openssl has version 1.1.1n but is declared as native` | **not a bug** — Windows applications resolved on Linux. `openssl.pyconf` is incremental; `default` sets `get_source : "native"` and `default_win` overrides it to `"archive"`. On Windows the overlay yields `archive` and resolves correctly. Resolving a Windows application on Linux is not a supported operation, and the lock is platform-specific by construction (D7) -- so this is the measurement reaching somewhere it should not have |
+
+So **40 of 162 applications, 25%, are blocked by two fixable lines**, and the lock is what
+found them. Neither is a regression: each fails today too, later and with less context.
+
+### The two upstream fixes
+
+**U1 — `OPENTURNS_SALOME.pyconf`, `default` section: delete the `compil_script` line.**
+Affects 36 applications.
+
+```
+build_source  : "cmake"           # <- not "script"
+compil_script : $name + "-" + $APPLICATION.products.OPENTURNS_SALOME + $VARS.scriptExtension
+```
+
+The expression builds a script filename from the version the application requested. That
+idiom is correct for a **prerequisite** — 72 product files use it, and applications pin
+those versions. But `OPENTURNS_SALOME` is declared with a bare key in **all 46** of the
+applications that include it, and pinned in none, so the reference resolves to `True` and
+the concatenation cannot ever succeed.
+
+It has gone unnoticed because the key is **dead**: `build_source` is `"cmake"`, and
+`compil_script` is only read when `product_has_script()` is true, which requires
+`build_source.lower() == 'script'` (`src/product.py:1161`). Nothing reads the key, so its
+expression has never had to evaluate.
+
+Deleting the line is the right fix, not pinning a version: a cmake-built product has no
+compile script. It is dead configuration that happens to be wrong.
+
+*Scope check, because the obvious worry is that this is systemic:* of 55 products ever
+declared bare — including the 15 always-bare internally-developed ones such as `SHAPER`,
+`SHAPERSTUDY`, `YDEFX` and `PARAVISADDONS` — **`OPENTURNS_SALOME` is the only one whose
+file references `$APPLICATION.products.<self>`**. `KERNEL`, `GUI`, `GEOM` and `SMESH` are
+not even always-bare, and never name their own version. The modules are immune because a
+git checkout at the application tag never needs its version in a filename. The single
+cross-product reference in the corpus is `hdf5_openmpi` reading `hdf5`, which is pinned in
+161 of 162 applications. **One file using the prerequisite idiom while consumed as a
+module — not a class.**
+
+**U2 — `SALOME-10.0.0*.pyconf`: `ParaView` asks for a section that does not exist.**
+Affects 4 applications.
+
+```
+ParaView : {tag:'6.1.0.c61dcc8ee0', base:'no', section:'version_6_1_0_MPI', hpc:'yes'}
+```
+
+`ParaView.pyconf` defines `default`, `version_6_0_0`, `version_6_0_0_MPI`,
+`version_6_0_0_MPI_CO9`, `version_6_0_0_MPI_FD44` and `version_6_0_0_win`. There is no
+`version_6_1_0_MPI` anywhere in the corpus. An explicit `section:` bypasses version
+matching entirely (`src/product.py:429`), so the miss is immediate rather than falling
+back to `default`.
+
+### Consequent open question
+
+What should lock generation do when a configuration has a latent error of this kind?
+
+- **Abort, naming the key and the expression.** Strictly more useful than today's failure,
+  which arrives during a build. But 28% of applications cannot adopt TOML until their
+  configuration is fixed -- and 36 of them need one line changed in one product file.
+- **Resolve what resolves, keep the rest raw.** Preserves today's behaviour exactly: the
+  broken value fails when read, not before. Reintroduces option 1's two-modes problem.
+
+**Decided: abort — but report every failure, not the first.**
+
+Aborting is right: a latent error found at load time, with the key and the expression
+named, beats the same error arriving mid-build. But dying on the first unresolvable value
+is what made this investigation expensive. The first run reported one `TypeError` with no
+indication that 35 other applications shared one cause, or that a second, unrelated bug
+accounted for 4 more, or that 6 of the failures were not bugs at all.
+
+So lock generation **collects** unresolvable values and reports them together:
+
+- group by cause, not by application — one entry for U1, not 36
+- name the key path, the expression, and the value that broke it
+  (`$APPLICATION.products.OPENTURNS_SALOME` resolved to `True`)
+- state the count of affected layers or products
+
+Same strictness, and the first encounter becomes an actionable list instead of a puzzle.
+This shapes Task 10's error path, and Task 5's writer needs to surface per-value failures
+rather than letting the first exception escape.
