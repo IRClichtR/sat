@@ -1765,7 +1765,11 @@ def run(args, runner, logger):
     
     # Make a unique file that contain all the jobs in order to use it 
     # on every machine
-    name_pyconf = "_".join([os.path.basename(path)[:-len('.pyconf')] 
+    # splitext, not [:-len('.pyconf')]: '.toml' is five characters, so slicing
+    # by a hardcoded length silently truncates the name. No write refusal here --
+    # this writes a temporary aggregate via get_tmp_filename, not a layer the
+    # user edits.
+    name_pyconf = "_".join([os.path.splitext(os.path.basename(path))[0]
                             for path in l_conf_files_path]) + ".pyconf"
     path_pyconf = src.get_tmp_filename(runner.cfg, name_pyconf)
     #Save config

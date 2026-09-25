@@ -20,6 +20,7 @@ import os
 import sys
 
 import src
+from src.configio.writers import writer_for_layer
 
 # Define all possible option for the init command :  sat init <options>
 parser = src.options.Options()
@@ -53,6 +54,13 @@ def set_local_value(config, key, value, logger):
     :return: 0 if all is OK, else 1
     :rtype: int
     """
+    # Refuse before touching anything: a TOML-sourced layer is the user's to
+    # edit, and writing local.pyconf beside an existing local.toml would break
+    # their next command with task 7's ambiguity error. Outside the try below,
+    # so the refusal reaches the user instead of the generic handler.
+    writer_for_layer(os.path.join(config.VARS.datadir, "local"), [],
+                     key="LOCAL.%s" % key)
+
     local_file_path = os.path.join(config.VARS.datadir, "local.pyconf")
     # Update the local.pyconf file
     try:
@@ -90,6 +98,9 @@ def add_local_project(config, project_file, logger):
         logger.write("Unable to add a project in local configuration, project file %s does not exist\n" % project_file, 1)
         return 1
 
+    writer_for_layer(os.path.join(config.VARS.datadir, "local"), [],
+                     key="PROJECTS.project_file_paths")
+
     # check that the project file exists
     local_file_path = os.path.join(config.VARS.datadir, "local.pyconf")
 
@@ -119,6 +130,9 @@ def reset_local_projects(config, logger):
     :return: 0 if all is OK, else 1
     :rtype: int
     """
+
+    writer_for_layer(os.path.join(config.VARS.datadir, "local"), [],
+                     key="PROJECTS.project_file_paths")
 
     local_file_path = os.path.join(config.VARS.datadir, "local.pyconf")
     # Update the local.pyconf file

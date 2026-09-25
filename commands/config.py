@@ -30,6 +30,7 @@ import src.debug as DBG
 from src.configio.discovery import resolve_layer, layer_is_toml
 from src.configio.readers import reader_for
 from src.configio import lock as LOCK
+from src.configio.writers import writer_for_layer
 import src.callerName as CALN
 
 logger = LOG.getDefaultLogger()
@@ -684,6 +685,13 @@ class ConfigManager:
         if not self.toml_layers:
             return cfg
 
+        # The lock is per application: its path, its header and its product
+        # collapse are all keyed on one. Commands that select no application --
+        # sat init, sat config --list -- have nothing to lock and resolve no
+        # products, so they take the ordinary route even with a TOML layer.
+        if self.application_name is None:
+            return cfg
+
         return self._through_lock(cfg, options)
 
     def _through_lock(self, cfg, options):
@@ -772,6 +780,11 @@ class ConfigManager:
                                  'evince', 
                                  "This is the pdf_viewer used "
                                  "to read pdf documentation\n")
+
+        # a SAT.toml the user wrote is theirs; SAT.pyconf absent is the normal
+        # first run and must still be creatable, which is why absence does not
+        # refuse
+        writer_for_layer(os.path.splitext(cfg_name)[0], [], key="USER")
 
         src.ensure_path_exists(config.VARS.personalDir)
         src.ensure_path_exists( osJoin(config.VARS.personalDir,
