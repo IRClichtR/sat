@@ -33,7 +33,6 @@ import json
 import os
 
 import src.pyconf as PYF
-import src.product as PROD
 from src.configio.readers import JsonReader
 from src.configio.writers import JsonWriter
 
@@ -71,6 +70,11 @@ def collapse_products(cfg):
         return
     if "PRODUCTS" not in cfg:
         return
+
+    # Imported here, not at module level: src.product imports SECTION_KEY from
+    # this module for its lock branch, so a module-level import either way
+    # round would make the cycle depend on which side is imported first.
+    import src.product as PROD
 
     products = cfg.PRODUCTS
     for name in cfg.APPLICATION.products.keys():
