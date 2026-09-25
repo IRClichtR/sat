@@ -94,6 +94,9 @@ parser.add_option('o', 'overwrite', 'list', "overwrite",
                   _("overwrites a configuration parameters."))
 parser.add_option('g', 'debug', 'boolean', 'debug_mode', 
                   _("run salomeTools in debug mode."))
+parser.add_option('', 'relock', 'boolean', "relock",
+                  _("regenerate the configuration lock even if it looks "
+                    "up to date (only affects applications with a .toml layer)."))
 parser.add_option('v', 'verbose', 'int', "output_verbose_level", 
                   _("change output verbose level (default is 3)."))
 parser.add_option('b', 'batch', 'boolean', "batch", 

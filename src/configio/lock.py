@@ -110,17 +110,21 @@ def collapse_products(cfg):
         object.__setattr__(flat, 'parent', products)
 
 
-def lock_path(cfg):
+def lock_path(cfg, name=None):
     """\
     Where this configuration's lock belongs.
 
     :param cfg: The merged configuration.
-    :return: <LOCAL.workdir>/.sat/<APPLICATION.name>.lock.json
+    :param name str: The application name. Defaults to APPLICATION.name, but the
+                     fast path in get_config has only the command-line argument
+                     at the point it needs this, and the two must agree or it
+                     would look for a lock nothing ever writes.
+    :return: <LOCAL.workdir>/.sat/<name>.lock.json
     :rtype: str
     """
     workdir = cfg.LOCAL.workdir
-    name = cfg.APPLICATION.name
-    return os.path.join(workdir, LOCK_DIR, "%s.lock.json" % name)
+    return os.path.join(workdir, LOCK_DIR,
+                        "%s.lock.json" % (name or cfg.APPLICATION.name))
 
 
 def write_lock(cfg, path, sources, overrides=None):
@@ -234,6 +238,72 @@ def is_stale(path, sources, cfg, overrides=None):
             return True
 
     return False
+
+
+def can_reuse(path, application, dist, sat_version, overrides=None):
+    """\
+    Whether a lock can be returned without building the configuration at all.
+
+    is_stale compares a lock against a freshly computed source list, so by the
+    time it can be called every layer has already been read -- correct, but it
+    saves nothing. This validates the lock against the inputs it *recorded*,
+    which is possible after two cheap files (internal and local) and before
+    projects, application, products and user are touched.
+
+    Sound rather than a shortcut: a source that could newly appear only becomes
+    relevant if a file already in the recorded set changed, because the
+    application file is what names the products and local.pyconf is what names
+    the projects. Either change invalidates the lock through its own triple, so
+    no separate discovery pass is needed to notice new files.
+
+    A pure-pyconf configuration never writes a lock, so a validating lock also
+    implies the configuration was TOML-sourced. That is what lets this run before
+    the TOML gate is known.
+
+    :param path str: The lock to validate.
+    :param application str: The application being built.
+    :param dist str: VARS.dist for this machine.
+    :param sat_version str: INTERNAL.sat_version.
+    :param overrides list: The command-line -o rules for this invocation.
+    :rtype: bool
+    """
+    if not os.path.isfile(path):
+        return False
+
+    try:
+        with open(path) as stream:
+            header = json.load(stream).get(LOCK_KEY)
+    except (ValueError, OSError):
+        return False
+
+    if not isinstance(header, dict):
+        return False
+    if header.get("application") != application:
+        return False
+    if header.get("dist") != dist:
+        return False
+    if header.get("sat_version") != sat_version:
+        return False
+    if sorted(header.get("overrides") or []) != sorted(overrides or []):
+        return False
+
+    recorded = header.get("sources")
+    if not isinstance(recorded, list) or not recorded:
+        # nothing to validate against means nothing can be trusted
+        return False
+
+    for entry in recorded:
+        try:
+            source, mtime, size = entry
+        except (TypeError, ValueError):
+            return False
+        if not os.path.isfile(source):
+            return False
+        stat = os.stat(source)
+        if int(stat.st_mtime) != mtime or stat.st_size != size:
+            return False
+
+    return True
 
 
 def _section_name(block):

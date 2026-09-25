@@ -29,6 +29,7 @@ import src.logger as LOG
 import src.debug as DBG
 from src.configio.discovery import resolve_layer, layer_is_toml
 from src.configio.readers import reader_for
+from src.configio import lock as LOCK
 import src.callerName as CALN
 
 logger = LOG.getDefaultLogger()
@@ -270,6 +271,8 @@ class ConfigManager:
         # the first and gated on the second
         self.sources = []
         self.toml_layers = []
+        # the fast path keys the lock on this, so the writer must use it too
+        self.application_name = application
 
         # create a ConfigMerger to handle merge
         merger = src.pyconf.ConfigMerger()#MergeHandler())
@@ -371,6 +374,32 @@ class ConfigManager:
         # apply overwrite from command line if needed
         for rule in self.get_command_line_overrides(options, ["LOCAL"]):
             exec('cfg.' + rule) # this cannot be factorized because of the exec
+
+        # =====================================================================
+        # The lock fast path.
+        #
+        # Everything needed to validate a lock is now available -- LOCAL.workdir,
+        # VARS.dist, INTERNAL.sat_version, the application name and the -o rules
+        # -- at a cost of two files read. A lock records the inputs it was built
+        # from, so it can be checked against those instead of against a list that
+        # would require reading every layer to compute. Returning here skips
+        # projects, application, products and user entirely: 461 files parsed
+        # becomes one JSON read.
+        #
+        # This cannot fire for a pure-pyconf configuration, because such a
+        # configuration never writes a lock. That is what makes it safe to run
+        # before the TOML gate is known.
+        if application is not None:
+            overrides = list(getattr(options, "overwrite", None) or []) \
+                        if options is not None else []
+            relock = bool(getattr(options, "relock", False)) \
+                     if options is not None else False
+            if not relock:
+                candidate = LOCK.lock_path(cfg, name=application)
+                if LOCK.can_reuse(candidate, application, cfg.VARS.dist,
+                                  cfg.INTERNAL.sat_version,
+                                  overrides=overrides):
+                    return LOCK.read_lock(candidate)
         
         # =====================================================================
         # Load the PROJECTS
@@ -648,7 +677,46 @@ class ConfigManager:
             # remove rm_products section after usage
             cfg.APPLICATION.__delitem__("rm_products")
 
-        return cfg
+        # =====================================================================
+        # The gate. A configuration that is entirely pyconf leaves here by the
+        # same route it always has, with nothing above this line having changed
+        # its value -- that is the constraint the whole feature is built under.
+        if not self.toml_layers:
+            return cfg
+
+        return self._through_lock(cfg, options)
+
+    def _through_lock(self, cfg, options):
+        """\
+        Route a TOML-sourced configuration through the JSON lock.
+
+        Under the model in the spec, the lock is not a report: it is the artifact
+        SAT executes against. So this returns the configuration **read back from
+        the lock**, never the in-memory tree it was built from. The two should be
+        identical, and if they are not, the first run says so rather than a
+        compile three weeks later.
+
+        :param cfg: The fully merged configuration.
+        :param options: The command options, for --relock and the -o overrides.
+        :return: The configuration the lock describes.
+        :rtype: class 'src.pyconf.Config'
+        """
+        overrides = list(getattr(options, "overwrite", None) or []) \
+                    if options is not None else []
+        path = LOCK.lock_path(cfg, name=self.application_name)
+        relock = bool(getattr(options, "relock", False)) \
+                 if options is not None else False
+
+        if not relock and not LOCK.is_stale(path, self.sources, cfg,
+                                            overrides=overrides):
+            return LOCK.read_lock(path)
+
+        # collapse first, then serialise: a resolved lock evaluates the whole
+        # tree, and platform-dead sections hold references that never resolve
+        # here. Task 8, concept 1.
+        LOCK.collapse_products(cfg)
+        LOCK.write_lock(cfg, path, self.sources, overrides=overrides)
+        return LOCK.read_lock(path)
 
     def set_user_config_file(self, config):
         '''Set the user config file name and path.

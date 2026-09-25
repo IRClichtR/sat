@@ -35,7 +35,8 @@ import unittest
 import initializeTest  # noqa: F401  -- must be first, sets sys.path
 import src.pyconf as PYF
 from src.configio.lock import (collapse_products, lock_path, write_lock,
-                               read_lock, is_stale, SECTION_KEY, LOCK_KEY)
+                               read_lock, is_stale, can_reuse,
+                               SECTION_KEY, LOCK_KEY)
 
 
 class LockTestCase(unittest.TestCase):
@@ -166,6 +167,76 @@ class TestStaleness(LockTestCase):
         with open(self.lock, "w") as stream:
             stream.write('{"A": {"name": "MYAPP"}}')
         self.assertTrue(is_stale(self.lock, self.sources(), self.cfg()))
+
+
+class TestCanReuse(LockTestCase):
+    """\
+    Validating a lock without building the configuration.
+
+    is_stale needs a freshly computed source list, which means reading every
+    layer first -- so using it makes the lock correct but free of any speedup.
+    can_reuse validates the lock against the inputs it recorded, which is
+    possible before a single layer has been read.
+    """
+
+    def args(self, overrides=None):
+        return dict(application="MYAPP", dist="UB24.04",
+                    sat_version=None, overrides=overrides)
+
+    def test_a_fresh_lock_can_be_reused(self):
+        write_lock(self.cfg(), self.lock, self.sources())
+        self.assertTrue(can_reuse(self.lock, **self.args()))
+
+    def test_a_missing_lock_cannot(self):
+        self.assertFalse(can_reuse(self.lock, **self.args()))
+
+    def test_an_edited_source_cannot(self):
+        write_lock(self.cfg(), self.lock, self.sources())
+        with open(self.src, "w") as stream:
+            stream.write("x = 2\nyyy = 3\n")
+        self.assertFalse(can_reuse(self.lock, **self.args()))
+
+    def test_a_touched_source_cannot(self):
+        write_lock(self.cfg(), self.lock, self.sources())
+        os.utime(self.src, (0, 0))
+        self.assertFalse(can_reuse(self.lock, **self.args()))
+
+    def test_a_deleted_source_cannot(self):
+        write_lock(self.cfg(), self.lock, self.sources())
+        os.remove(self.src)
+        self.assertFalse(can_reuse(self.lock, **self.args()))
+
+    def test_another_application_cannot(self):
+        write_lock(self.cfg(), self.lock, self.sources())
+        args = self.args()
+        args["application"] = "OTHER"
+        self.assertFalse(can_reuse(self.lock, **args))
+
+    def test_another_platform_cannot(self):
+        write_lock(self.cfg(), self.lock, self.sources())
+        args = self.args()
+        args["dist"] = "CO9"
+        self.assertFalse(can_reuse(self.lock, **args))
+
+    def test_a_different_override_cannot(self):
+        write_lock(self.cfg(), self.lock, self.sources(),
+                   overrides=["APPLICATION.debug='yes'"])
+        self.assertFalse(can_reuse(self.lock, **self.args()))
+
+    def test_the_same_override_can(self):
+        rules = ["APPLICATION.debug='yes'"]
+        write_lock(self.cfg(), self.lock, self.sources(), overrides=rules)
+        self.assertTrue(can_reuse(self.lock, **self.args(overrides=rules)))
+
+    def test_an_unreadable_lock_cannot(self):
+        with open(self.lock, "w") as stream:
+            stream.write("{not json")
+        self.assertFalse(can_reuse(self.lock, **self.args()))
+
+    def test_a_lock_with_no_recorded_sources_cannot(self):
+        # nothing to validate against means nothing can be trusted
+        write_lock(self.cfg(), self.lock, [])
+        self.assertFalse(can_reuse(self.lock, **self.args()))
 
 
 class TestOverridesInTheKey(LockTestCase):
