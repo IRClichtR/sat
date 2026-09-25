@@ -28,6 +28,7 @@ test and removed afterwards.
 
 import os
 import shutil
+import tempfile
 import sys
 import unittest
 
@@ -86,6 +87,59 @@ class TestPurePyconfIsUntouched(unittest.TestCase):
         manager = ConfigManager()
         manager.get_config(application="APPLI_TEST")
         self.assertEqual(manager.toml_layers, [])
+
+
+@NEEDS_TOMLLIB
+class TestTomlLayerWithoutAnApplication(unittest.TestCase):
+    """\
+    A TOML layer and no application selected.
+
+    Regression test. The lock is keyed on an application -- its path, its header
+    and its product collapse all need one -- but a TOML LOCAL layer opens the
+    gate for commands that select no application at all. `sat init` did exactly
+    this and crashed in lock_path with
+    AttributeError: Unknown pyconf key: 'APPLICATION'.
+
+    Found by hand, not by a test, which is why this one exists. get_config takes
+    datadir, so a TOML local layer can be supplied without touching the repo.
+    """
+
+    def setUp(self):
+        self.datadir = tempfile.mkdtemp(prefix="sat_nodatadir_")
+        project = os.path.join(SATDIR, "data", "local.pyconf")
+        keys = {}
+        for line in open(project):
+            if ":" in line and not line.strip().startswith("#"):
+                name, _, value = line.partition(":")
+                keys[name.strip()] = value.strip().strip("'\"")
+        with open(os.path.join(self.datadir, "local.toml"), "w") as stream:
+            stream.write("[LOCAL]\n")
+            for name in ("base", "workdir", "archive_dir", "VCS", "tag",
+                         "log_dir"):
+                stream.write('%s = "%s"\n' % (name, keys.get(name, "default")))
+            stream.write("\n[PROJECTS]\nproject_file_paths = []\n")
+
+    def tearDown(self):
+        shutil.rmtree(self.datadir, ignore_errors=True)
+
+    def test_no_application_does_not_crash(self):
+        manager = ConfigManager()
+        cfg = manager.get_config(datadir=self.datadir, options=Options())
+        self.assertEqual(len(manager.toml_layers), 1,
+                         "the TOML local layer should have been detected")
+        self.assertIn("LOCAL", cfg.keys())
+
+    def test_no_lock_is_written_without_an_application(self):
+        manager = ConfigManager()
+        cfg = manager.get_config(datadir=self.datadir, options=Options())
+        self.assertNotIn(LOCK_KEY, cfg.keys())
+        self.assertFalse(os.path.isdir(
+            os.path.join(cfg.LOCAL.workdir, ".sat")))
+
+    def test_the_toml_local_values_are_read(self):
+        manager = ConfigManager()
+        cfg = manager.get_config(datadir=self.datadir, options=Options())
+        self.assertTrue(cfg.LOCAL.base)
 
 
 @NEEDS_TOMLLIB
