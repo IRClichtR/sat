@@ -29,7 +29,7 @@ import pprint as PP
 import src
 import src.debug as DBG
 import src.versionMinorMajorPatch as VMMP
-from src.configio.lock import SECTION_KEY
+from src.configio.keys import SECTION_KEY
 
 AVAILABLE_VCS = ['git', 'svn', 'cvs']
 
