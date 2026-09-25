@@ -227,6 +227,10 @@ class ConfigManager:
         """
         if path is None:
             return
+        if any(entry[0] == path for entry in self.sources):
+            # one file consumed twice -- a project listed twice, a product
+            # reachable by two search-path entries -- must appear once
+            return
         try:
             stat = os.stat(path)
         except OSError:
@@ -400,7 +404,7 @@ class ConfigManager:
                 if LOCK.can_reuse(candidate, application, cfg.VARS.dist,
                                   cfg.INTERNAL.sat_version,
                                   overrides=overrides):
-                    return LOCK.read_lock(candidate)
+                    return self._adopt_lock(LOCK.read_lock(candidate), cfg)
         
         # =====================================================================
         # Load the PROJECTS
@@ -717,14 +721,44 @@ class ConfigManager:
 
         if not relock and not LOCK.is_stale(path, self.sources, cfg,
                                             overrides=overrides):
-            return LOCK.read_lock(path)
+            return self._adopt_lock(LOCK.read_lock(path), cfg)
 
         # collapse first, then serialise: a resolved lock evaluates the whole
         # tree, and platform-dead sections hold references that never resolve
         # here. Task 8, concept 1.
         LOCK.collapse_products(cfg)
         LOCK.write_lock(cfg, path, self.sources, overrides=overrides)
-        return LOCK.read_lock(path)
+        return self._adopt_lock(LOCK.read_lock(path), cfg)
+
+    def _adopt_lock(self, locked, cfg):
+        """\
+        Hand back a configuration read from the lock, with VARS from this run.
+
+        Everything else in the lock is a fact about the configuration and is
+        meant to be cached. VARS is not: _create_vars recomputes it on every
+        invocation, and src/logger.py:66-69 builds the log file name from
+        VARS.datehour, VARS.command and VARS.hostname. Serving the writing run's
+        VARS made every lock-reusing command write to the same log file,
+        overwriting the previous run's log -- silently, on the ordinary path.
+
+        The source list is taken from the lock's own header as well, so that
+        `sources` means the same thing whichever route produced the result.
+
+        :param locked: The configuration read back from the lock.
+        :param cfg: The configuration built during this invocation.
+        :return: locked, with this run's VARS.
+        :rtype: class 'src.pyconf.Config'
+        """
+        locked["VARS"] = cfg.VARS
+        # a Mapping adopted from another tree keeps that tree as its parent, and
+        # a reference inside it would then resolve against the wrong root
+        object.__setattr__(locked["VARS"], 'parent', locked)
+
+        header = locked[LOCK.LOCK_KEY] if LOCK.LOCK_KEY in locked else None
+        if header is not None and "sources" in header:
+            self.sources = [[entry[0], entry[1], entry[2]]
+                            for entry in header.sources]
+        return locked
 
     def set_user_config_file(self, config):
         '''Set the user config file name and path.

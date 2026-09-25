@@ -31,6 +31,7 @@ invalidation, which is why is_stale is the most important function here.
 
 import json
 import os
+import tempfile
 
 import src.pyconf as PYF
 from src.configio.readers import JsonReader
@@ -132,6 +133,11 @@ def write_lock(cfg, path, sources, overrides=None):
     Call collapse_products first. Serialising an uncollapsed tree evaluates
     references belonging to platforms this machine will never build for.
 
+    If this raises, no lock is written and any previous one is untouched -- but
+    the configuration the caller passed has already been collapsed in place by
+    collapse_products, so it is not a tree to carry on with. get_config treats a
+    failure here as fatal for that reason.
+
     :param cfg: The collapsed configuration.
     :param path str: Where to write. Parent directories are created.
     :param sources list: One [path, mtime, size] per file consumed, for every
@@ -169,8 +175,22 @@ def write_lock(cfg, path, sources, overrides=None):
     header.addMapping("overrides", rules, None, setting=True)
 
     cfg[LOCK_KEY] = header
-    with open(path, "w") as stream:
-        JsonWriter().write(cfg, stream, resolved=True)
+    # Atomic: a torn lock is worse than no lock. An interrupted write, or two
+    # SAT processes generating the same lock at once -- sat jobs fanning out over
+    # one workdir will do exactly that -- would otherwise leave truncated JSON
+    # for the run that reads it mid-write. os.replace is atomic on POSIX and on
+    # Windows within a volume, so readers see either the old lock or the new one.
+    handle, temporary = tempfile.mkstemp(dir=directory or ".",
+                                         prefix=".lock-", suffix=".json")
+    try:
+        with os.fdopen(handle, "w") as stream:
+            JsonWriter().write(cfg, stream, resolved=True)
+        os.replace(temporary, path)
+    except BaseException:
+        # the write failed, so the previous lock -- if any -- is left intact
+        if os.path.exists(temporary):
+            os.remove(temporary)
+        raise
 
 
 def read_lock(path):

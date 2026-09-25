@@ -29,6 +29,7 @@ test and removed afterwards.
 import os
 import shutil
 import tempfile
+import time
 import sys
 import unittest
 
@@ -251,6 +252,84 @@ class TestTomlApplicationGoesThroughTheLock(unittest.TestCase):
         mtime = os.path.getmtime(self.lock)
         self.load(Options(overwrite=rules))
         self.assertEqual(os.path.getmtime(self.lock), mtime)
+
+
+@NEEDS_TOMLLIB
+class TestVolatileVarsAreNotCached(unittest.TestCase):
+    """\
+    Review B1. VARS is recomputed by _create_vars on every invocation, so it
+    must never be served from the lock.
+
+    src/logger.py:66-69 builds the log file name from
+    VARS.datehour + VARS.command + VARS.hostname. A lock-reusing command that
+    inherited the writing run's VARS wrote to the same log file every time,
+    overwriting the previous run's log.
+    """
+
+    NAME = "VOLATILE"
+
+    def setUp(self):
+        self.appli = os.path.join(APPLI_DIR, self.NAME + ".toml")
+        text = open(FIXTURE).read().replace('"APPLI_TEST"', '"%s"' % self.NAME)
+        with open(self.appli, "w") as stream:
+            stream.write(text)
+        self.lock = None
+
+    def tearDown(self):
+        if os.path.exists(self.appli):
+            os.remove(self.appli)
+        if self.lock and os.path.exists(self.lock):
+            shutil.rmtree(os.path.dirname(self.lock), ignore_errors=True)
+
+    def load(self, command):
+        manager = ConfigManager()
+        cfg = manager.get_config(application=self.NAME, options=Options(),
+                                 command=command)
+        self.lock = os.path.join(cfg.LOCAL.workdir, ".sat",
+                                 "%s.lock.json" % self.NAME)
+        return cfg
+
+    def test_the_command_is_this_invocation_s_command(self):
+        self.load("config")                      # cold: writes the lock
+        warm = self.load("compile")              # warm: reuses it
+        self.assertEqual(warm.VARS.command, "compile")
+
+    def test_the_timestamp_is_this_invocation_s(self):
+        cold = self.load("config")
+        time.sleep(1.1)
+        warm = self.load("config")
+        self.assertNotEqual(cold.VARS.datehour, warm.VARS.datehour,
+                            "a reused lock served a stale datehour, so every "
+                            "run would write to the same log file")
+
+    def test_the_lock_is_still_reused(self):
+        # the fix must not defeat the cache it is correcting
+        self.load("config")
+        mtime = os.path.getmtime(self.lock)
+        self.load("config")
+        self.assertEqual(os.path.getmtime(self.lock), mtime)
+
+    def test_the_rest_of_the_config_still_comes_from_the_lock(self):
+        self.load("config")
+        warm = self.load("compile")
+        self.assertIn(LOCK_KEY, warm.keys())
+        self.assertIn(SECTION_KEY, warm.PRODUCTS.KERNEL.keys())
+
+    def test_vars_hangs_from_the_returned_config(self):
+        # a Mapping adopted from another tree keeps that tree as its parent,
+        # which would make references inside it resolve against the wrong root
+        self.load("config")
+        warm = self.load("compile")
+        self.assertIs(object.__getattribute__(warm.VARS, 'parent'), warm)
+
+    def test_the_full_source_list_is_reported_on_the_fast_path(self):
+        # review S1: self.sources held 2 entries on the fast path and 12 on a
+        # full build, so its meaning depended on which path ran
+        self.load("config")
+        manager = ConfigManager()
+        manager.get_config(application=self.NAME, options=Options(),
+                           command="compile")
+        self.assertGreater(len(manager.sources), 5)
 
 
 if __name__ == '__main__':
