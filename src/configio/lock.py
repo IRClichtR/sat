@@ -81,9 +81,14 @@ def collapse_products(cfg):
         if name not in products:
             continue
 
-        version, section = _requested(cfg, name)
-        block = PROD.get_product_section(cfg, name, _normalise_version(version),
-                                         section)
+        # get_product_config, not get_product_section: the section decision is
+        # only half of what a resolved lock needs. $install_dir is referenced by
+        # 521 values across 33 product files and exists in none of them --
+        # get_install_dir computes it at runtime -- so a lock written from the
+        # section alone cannot be resolved at all (spec section 16, option 2).
+        # Calling the real function keeps one implementation of that decision,
+        # which is the same reason the section itself is not re-derived here.
+        block = PROD.get_product_config(cfg, name)
         if block is None:
             continue
 
@@ -98,7 +103,7 @@ def collapse_products(cfg):
         data = object.__getattribute__(block, 'data')
         for key in block.keys():
             flat.addMapping(key, data[key], None, setting=True)
-        flat.addMapping(SECTION_KEY, _section_name(block, section), None,
+        flat.addMapping(SECTION_KEY, _section_name(block), None,
                         setting=True)
 
         products[name] = flat
@@ -216,63 +221,16 @@ def is_stale(path, sources, cfg):
     return False
 
 
-def _requested(cfg, name):
-    """\
-    What the application asks of one product: a version, and maybe a section.
-
-    Mirrors the small first half of get_product_config (src/product.py:51-120).
-    Only the shapes are reproduced here -- bool, str, Mapping -- never the
-    section matching, which get_product_section owns. If the application ever
-    grows a fourth shape, this is the second place that must learn it.
-
-    :return: (version, section or None)
-    :rtype: tuple
-    """
-    requested = cfg.APPLICATION.products[name]
-
-    if isinstance(requested, PYF.Mapping):
-        version = (requested.tag if "tag" in requested
-                   else cfg.APPLICATION.tag)
-        section = requested.section if "section" in requested else None
-        return version, section
-
-    if isinstance(requested, bool):
-        # the bare-key shorthand: this product, at the application's own tag
-        return cfg.APPLICATION.tag, None
-
-    return requested, None
-
-
-def _normalise_version(version):
-    """\
-    Spell a version the way product sections are keyed.
-
-    pyconf cannot use '.', '-' or '/' in a key, so a product asking for
-    '1.71.0' must be matched against the section named version_1_71_0.
-    get_product_config does this substitution before calling
-    get_product_section (src/product.py:168); skipping it makes every dotted
-    version miss its section and fall through to default, which is a product
-    silently built from the wrong definition.
-
-    :param version: The version as the application spells it.
-    :rtype: str
-    """
-    text = str(version)
-    for character in ".-/":
-        text = text.replace(character, "_")
-    return text
-
-
-def _section_name(block, requested_section):
+def _section_name(block):
     """\
     Which section won.
 
-    get_product_section sets `section` on what it returns, so prefer that; fall
-    back to an explicit request, then to 'default'.
+    get_product_config sets `section` on the product info it returns, by way of
+    get_product_section. 'default' is the fallback that function itself uses.
     """
     if "section" in block:
         return block.section
-    return requested_section or "default"
+    return "default"
 
 
 def _sat_version(cfg):

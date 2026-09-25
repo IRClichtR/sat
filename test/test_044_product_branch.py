@@ -32,6 +32,11 @@ that a configuration with no lock behaves exactly as it does today.
 import unittest
 
 import initializeTest  # noqa: F401  -- must be first, sets sys.path
+# src.salomeTools installs gettext at import (line 76), which is what makes _()
+# available to src.product's messages. commands/__init__.py looks like it does
+# this too, but lines 2-41 of that file are one docstring, so it is inert.
+import src.salomeTools  # noqa: F401
+import src
 import src.pyconf as PYF
 import src.product as PROD
 from src.configio.lock import SECTION_KEY
@@ -170,6 +175,64 @@ class TestUnlockedConfigIsUntouched(unittest.TestCase):
         finally:
             PROD.get_product_section = original
         self.assertEqual(seen, ["1_71_0"])
+
+
+class TestExplicitSectionGuard(unittest.TestCase):
+    """\
+    A pre-existing bug in get_product_section, found while locking the corpus.
+
+    An application may name a product section explicitly:
+
+        ParaView : {tag: '6.1.0...', section: 'version_6_1_0_MPI'}
+
+    If that section does not exist the guard sets pi to None and then looks it
+    up anyway, so the caller gets AttributeError instead of the diagnostic the
+    None path exists to produce. Four applications in SAT_SALOME do this.
+    """
+
+    def product(self):
+        cfg = PYF.Config()
+        cfg.addMapping("PRODUCTS", PYF.Mapping(cfg), "")
+        cfg.PRODUCTS.addMapping("ParaView", PYF.Mapping(cfg.PRODUCTS), "")
+        product = cfg.PRODUCTS.ParaView
+        product["from_file"] = "/fake/products/ParaView.pyconf"
+        product.addMapping("version_6_0_0_MPI", PYF.Mapping(product), "")
+        product.version_6_0_0_MPI["name"] = "ParaView"
+        return cfg
+
+    def test_an_existing_explicit_section_is_returned(self):
+        block = PROD.get_product_section(self.product(), "ParaView", "6_0_0",
+                                         "version_6_0_0_MPI")
+        self.assertEqual(block.section, "version_6_0_0_MPI")
+
+    def test_a_missing_explicit_section_raises_naming_it(self):
+        with self.assertRaises(src.SatException) as caught:
+            PROD.get_product_section(self.product(), "ParaView", "6_1_0",
+                                     "version_6_1_0_MPI")
+        message = str(caught.exception)
+        self.assertIn("version_6_1_0_MPI", message)
+        self.assertIn("ParaView", message)
+
+    def test_the_message_suggests_the_closest_defined_section(self):
+        # for the real case this suggests version_6_0_0_MPI out of 66 defined
+        # sections, which makes the application's typo obvious
+        with self.assertRaises(src.SatException) as caught:
+            PROD.get_product_section(self.product(), "ParaView", "6_1_0",
+                                     "version_6_1_0_MPI")
+        self.assertIn("version_6_0_0_MPI", str(caught.exception))
+
+    def test_a_missing_section_does_not_fall_back_for_an_incremental_product(self):
+        # the trap in the first attempt at this fix: pi=None then falls into the
+        # incremental branch, which quietly uses 'default'
+        cfg = self.product()
+        product = cfg.PRODUCTS.ParaView
+        product.addMapping("default", PYF.Mapping(product), "")
+        product.default["name"] = "ParaView"
+        product.default.addMapping("properties", PYF.Mapping(product.default), "")
+        product.default.properties["incremental"] = "yes"
+        with self.assertRaises(src.SatException):
+            PROD.get_product_section(cfg, "ParaView", "6_1_0",
+                                     "version_6_1_0_MPI")
 
 
 if __name__ == '__main__':

@@ -171,7 +171,8 @@ class TestStaleness(LockTestCase):
 class TestCollapse(unittest.TestCase):
     """The winning section is chosen by SAT's own code, then stored flat."""
 
-    def build(self, products_entry="'1_71_0'", incremental=False):
+    def build(self, products_entry="'1_71_0'", incremental=False,
+              environ_ref=False):
         """\
         A config shaped the way get_product_section expects.
 
@@ -183,6 +184,7 @@ APPLICATION :
 {
     name : 'MYAPP'
     tag : 'master'
+    workdir : '/tmp/work/MYAPP'
     products : { boost : %s }
 }
 PRODUCTS :
@@ -195,24 +197,48 @@ PRODUCTS :
         default :
         {
             name : 'boost'
-            build_source : 'script'
+            build_source : 'autotools'
+            get_source : 'archive'
             %s
         }
         version_1_71_0 :
         {
             name : 'boost'
             build_source : 'cmake'
+            get_source : 'archive'
+            %s
         }
         default_win :
         {
             name : 'boost'
+            get_source : 'archive'
             compil_script : 'boost.bat'
         }
     }
 }
 ''' % (products_entry,
-       'properties : { incremental : "yes" }' if incremental else '')
-        return PYF.Config(io.StringIO(text))
+       'properties : { incremental : "yes" }' if incremental else '',
+       'environ : { PREFIX : $install_dir + "/bin" }' if environ_ref else '')
+        cfg = PYF.Config(io.StringIO(text))
+        # get_product_config derives more than get_product_section does, so the
+        # fixture must carry what that derivation reads: LOCAL.tag for
+        # get_salometool_version, PATHS for the archive and script lookups,
+        # LOCAL.workdir and VARS for get_install_dir
+        cfg.addMapping("LOCAL", PYF.Mapping(cfg), "")
+        cfg.LOCAL["tag"] = "5.3.0"
+        cfg.LOCAL["workdir"] = "/tmp/work"
+        cfg.LOCAL["base"] = "/tmp/base"
+        cfg.addMapping("VARS", PYF.Mapping(cfg), "")
+        cfg.VARS["sep"] = "/"
+        cfg.VARS["dist"] = "UB24.04"
+        cfg.VARS["scriptExtension"] = ".sh"
+        cfg.addMapping("PATHS", PYF.Mapping(cfg), "")
+        cfg.PATHS["ARCHIVEPATH"] = PYF.Sequence(cfg.PATHS)
+        cfg.PATHS["PRODUCTPATH"] = PYF.Sequence(cfg.PATHS)
+        cfg.addMapping("INTERNAL", PYF.Mapping(cfg), "")
+        cfg.INTERNAL.addMapping("config", PYF.Mapping(cfg.INTERNAL), "")
+        cfg.INTERNAL.config["install_dir"] = "INSTALL"
+        return cfg
 
     def test_the_winning_section_is_recorded(self):
         cfg = self.build()
@@ -243,7 +269,7 @@ PRODUCTS :
         cfg = self.build(products_entry="'9_9_9'")
         collapse_products(cfg)
         self.assertEqual(cfg.PRODUCTS.boost[SECTION_KEY], "default")
-        self.assertEqual(cfg.PRODUCTS.boost.build_source, "script")
+        self.assertEqual(cfg.PRODUCTS.boost.build_source, "autotools")
 
     def test_an_explicit_section_override_is_honoured(self):
         cfg = self.build(products_entry="{ tag : '1_71_0', section : 'default' }")
@@ -280,7 +306,11 @@ PRODUCTS :
         self.assertEqual(cfg.PRODUCTS.boost[SECTION_KEY], "version_1_71_0")
         self.assertEqual(cfg.PRODUCTS.boost.build_source, "cmake")
 
-    def test_collapsing_twice_is_idempotent(self):
+    def test_collapsing_twice_changes_no_value(self):
+        # get_product_config keeps its own install_dir_save bookkeeping for
+        # repeat calls, so a second collapse adds that one key. Every value the
+        # first collapse produced must still be the same -- which is what
+        # matters, since a lock regenerated twice must describe one product.
         cfg = self.build(incremental=True)
         collapse_products(cfg)
         first = dict((k, cfg.PRODUCTS.boost[k])
@@ -288,7 +318,30 @@ PRODUCTS :
         collapse_products(cfg)
         second = dict((k, cfg.PRODUCTS.boost[k])
                       for k in cfg.PRODUCTS.boost.keys())
-        self.assertEqual(first, second)
+        for key in first:
+            self.assertEqual(first[key], second[key], "%s changed" % key)
+        self.assertEqual(set(second) - set(first), {"install_dir_save"})
+
+    def test_install_dir_is_derived_and_stored(self):
+        # decision 16, option 2: $install_dir is referenced by 521 values in 33
+        # product files but exists nowhere in any file -- get_product_config
+        # computes it, so the collapse must call that and keep the result, or
+        # the resolved lock cannot be written at all
+        cfg = self.build()
+        collapse_products(cfg)
+        self.assertIn("install_dir", cfg.PRODUCTS.boost.keys())
+        self.assertTrue(cfg.PRODUCTS.boost.install_dir)
+
+    def test_install_mode_is_stored_alongside_it(self):
+        cfg = self.build()
+        collapse_products(cfg)
+        self.assertIn("install_mode", cfg.PRODUCTS.boost.keys())
+
+    def test_a_reference_to_install_dir_resolves_after_collapse(self):
+        cfg = self.build(environ_ref=True)
+        collapse_products(cfg)
+        self.assertTrue(
+            cfg.PRODUCTS.boost.environ.PREFIX.endswith("/bin"))
 
     def test_a_config_without_products_is_left_alone(self):
         cfg = PYF.Config()
