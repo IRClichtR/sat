@@ -36,11 +36,9 @@ import src.pyconf as PYF
 from src.configio.readers import JsonReader
 from src.configio.writers import JsonWriter
 
-#: Header key holding everything whose change invalidates the lock.
-LOCK_KEY = "__lock__"
-
-#: Key recording which product section won the collapse.
-SECTION_KEY = "__section__"
+# Re-exported from the leaf module so that src/product.py can reach SECTION_KEY
+# without importing this one. See src/configio/keys.py for why that matters.
+from src.configio.keys import LOCK_KEY, SECTION_KEY
 
 #: Directory, relative to LOCAL.workdir, holding generated locks.
 LOCK_DIR = ".sat"

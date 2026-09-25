@@ -28,7 +28,9 @@ own base class rather than an unimplemented half of Reader.
 import abc
 import json
 
+import src
 import src.pyconf as PYF
+from src.configio.discovery import resolve_layer, layer_is_toml
 
 
 class Writer(abc.ABC):
@@ -160,3 +162,47 @@ class JsonWriter(Writer):
             return self._convert(evaluated, container, resolved, path, failures)
 
         return node
+
+
+class TomlWriteRefused(src.SatException):
+    """Raised when SAT is asked to write back a layer whose source is TOML."""
+
+
+def writer_for_layer(stem, search_paths, key=None):
+    """\
+    The writer for a configuration layer, or a refusal if its source is TOML.
+
+    TOML is written by people, not by tools (spec D4), so a layer that came from
+    a .toml file is never written back over. The refusal matters more than it
+    looks: task 7 makes two files for one layer fatal, so silently writing
+    local.pyconf beside an existing local.toml would break the user's next
+    command with an error naming a file they never created. An invariant
+    enforced on read but not on write is a trap, not an invariant.
+
+    Absence is not TOML. create_config_file exists to create a user
+    configuration that is not there yet, and refusing that would break every
+    first run.
+
+    :param stem str: The layer path or name, without extension.
+    :param search_paths list: Directories to try for a bare name.
+    :param key str: The configuration key the caller was about to change, named
+                    in the refusal so the user knows what to edit. Optional,
+                    because not every site changes a single key.
+    :return: A writer for the layer.
+    :rtype: class 'Writer'
+    :raise TomlWriteRefused: If the layer's source is a .toml file.
+    :raise AmbiguousLayerError: If two files define the layer -- task 7's error,
+                                deliberately not masked here.
+    """
+    path, _reader = resolve_layer(stem, search_paths)
+
+    if layer_is_toml(path):
+        what = _("Set %s in:") % key if key else _("Edit:")
+        raise TomlWriteRefused(
+            _("""\
+cannot write TOML configuration.
+  SAT does not write .toml files -- they are yours to edit.
+  %(what)s
+      %(path)s""") % {"what": what, "path": path})
+
+    return PyconfWriter()
