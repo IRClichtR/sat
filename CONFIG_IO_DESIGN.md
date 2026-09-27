@@ -822,3 +822,73 @@ So lock generation **collects** unresolvable values and reports them together:
 Same strictness, and the first encounter becomes an actionable list instead of a puzzle.
 This shapes Task 10's error path, and Task 5's writer needs to surface per-value failures
 rather than letting the first exception escape.
+
+
+---
+
+## 17. Limits as a pyconf replacement
+
+This feature makes TOML a supported **input** format. It does not make TOML a replacement
+for pyconf, and the gap is deliberate rather than unfinished. If the objective becomes
+full replacement, D4 and §12 are what have to change first; `plan/13-extended-feature.md`
+plans that work.
+
+### What is replaced
+
+| | status |
+|---|---|
+| reading a configuration layer | TOML at all six layers (D3) |
+| `${}` interpolation | §4, layered onto TOML as a string convention |
+| the object model | unchanged — every reader produces `pyconf.Config` |
+| the execution artifact | the JSON lock (§1), for any configuration with a TOML layer |
+
+### What is not
+
+**SAT cannot write TOML.** D4, enforced by `writers.writer_for_layer`, which raises
+`TomlWriteRefused`. The consequences are concrete rather than theoretical:
+
+| command | consequence |
+|---|---|
+| `sat init --base`, `sat init --add_project` | refuses against a `local.toml`; the user edits the file themselves |
+| `sat config` first run | can create `SAT.pyconf`, never `SAT.toml` |
+| `sat package` | regenerates `local.pyconf` and `<product>.pyconf` into the archive, **silently converting a TOML-sourced configuration to pyconf** (impact map C1) |
+
+So a workspace cannot today be **pyconf-free**: `sat init` needs to write somewhere, and
+`sat package` emits pyconf regardless of what it read.
+
+### Why writing is the hard half
+
+Not a matter of effort ordering. Three facts, each verified:
+
+1. **`tomllib` is read-only.** It exports `load`, `loads` and `TOMLDecodeError` and
+   nothing else. Writing was left out of it, and an external writer such as `tomli_w`
+   violates the zero-dependency constraint (§3). Any TOML writer is written from scratch.
+2. **`tomllib` discards comments.** A `Config` built from TOML has none, so serialising
+   the tree back out cannot restore them. pyconf's `Config.__save__` *does* keep comment
+   content — it relocates a trailing comment onto its own line, but does not lose it. A
+   TOML writer that serialises from the tree is therefore strictly worse than the format
+   it replaces, for files humans maintain.
+3. **A `${}` re-serialiser does not exist.** `interp.parse_template` turns
+   `"${A.b}/x"` into `Reference`/`Expression`; nothing goes the other way. The lock's raw
+   mode emits pyconf `$`-syntax on purpose (§4), as a diagnostic, not as TOML.
+
+Preserving comments therefore needs **text-level editing of the original file**, which
+means a second, position-aware TOML scanner alongside `tomllib` — and two parsers that
+can disagree about one document.
+
+### The limit that is not about writing
+
+A TOML-only workspace still cannot escape the `yes`/`no` convention. SAT compares against
+those strings at 58 sites across 14 files, so `debug = true` reads as `"no"` (D10). That is
+independent of the writer and is planned separately in §13.
+
+### Summary
+
+| objective | status |
+|---|---|
+| accept TOML input | **done** |
+| execute against a generated artifact | **done** (the lock) |
+| leave pyconf configurations untouched | **done**, verified byte-identical |
+| author a configuration entirely in TOML | partial — readable, not writable |
+| a pyconf-free workspace | **not possible** — `sat init` and `sat package` both write pyconf |
+| booleans instead of `yes`/`no` | **no** — §13 |
