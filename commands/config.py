@@ -31,6 +31,7 @@ from src.configio.discovery import resolve_layer, layer_is_toml
 from src.configio.readers import reader_for
 from src.configio import lock as LOCK
 from src.configio.writers import writer_for_layer
+from src.configio.validate import validate_toml
 import src.callerName as CALN
 
 logger = LOG.getDefaultLogger()
@@ -72,6 +73,9 @@ parser.add_option('', 'show_properties', 'boolean', 'show_properties',
     _("Optional: synthetic list of all properties used in the application"))
 parser.add_option('', 'check_system', 'boolean', 'check_system',
     _("Optional: check if system products are installed"))
+parser.add_option('', 'validate', 'string', 'validate',
+    _("Optional: check that a .toml configuration file is well formed: TOML "
+      "syntax, ${} templates and value rules. References are not resolved."))
 parser.add_option('c', 'copy', 'boolean', 'copy',
     _("""Optional: copy a config file to the personal config files directory.
 WARNING: the included files are not copied.
@@ -1318,7 +1322,18 @@ def run(args, runner, logger):
     '''
     # Parse the options
     (options, args) = parser.parse_args(args)
-    
+
+    # validate a TOML file on its own; needs no application
+    if options.validate:
+        errors = validate_toml(options.validate)
+        for error in errors:
+            logger.write("%s\n" % src.printcolors.printcError(error), 1)
+        if errors:
+            return 1
+        logger.write("%s: %s\n" % (options.validate,
+                                   src.printcolors.printcSuccess("OK")), 1)
+        return 0
+
     # print products list based from the properties key
     if options.properties:
         products_infos = src.product.get_products_list(options, runner.cfg, logger)
