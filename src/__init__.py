@@ -43,6 +43,7 @@ from . import fileEnviron
 from . import compilation
 from . import test_module
 from . import template
+from . import venv
 
 import platform
 if platform.system() == "Windows" :
