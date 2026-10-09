@@ -1,11 +1,39 @@
-# SAT Config IO — Architectural Decisions
+# SAT Config IO — Design
 
-**Status:** design agreed, not implemented
-**Date:** 2026-09-02
+**Status:** implemented (tasks 1–11), reviewed (`plan/12-review.md`); manual test in progress (`plan/manual_test.md`)
+**Date:** 2026-09-02, restructured 2026-09-29
 **Source:** `INSTRUCTIONS.md` (exploration prompt), refined through design dialogue
 **Scope:** accept `.toml` configuration input, produce a `.json` lock consumed at runtime, alongside the existing `pyconf` machinery
 
+The document has four parts:
+
+| part | answers | sections |
+|---|---|---|
+| **I** | what the feature is, and what it gains | 1–2 |
+| **II** | which architecture decisions are settled, and why | 3–11 |
+| **III** | what is not decided yet, and where the feature stops | 12–16 |
+| **IV** | reference: corpus evidence, format correspondence, impact map | 17–19 |
+
+A decision lives in Part II **or** Part III, never both. If a Part II decision is reopened,
+it moves to §12 with the new evidence.
+
+**Section numbers changed on 2026-09-29.** Plan files written earlier cite the old ones:
+
+| old § | new § | | old § | new § |
+|---|---|---|---|---|
+| 1 Model | 1 | | 10 Rejected alternatives | 10 |
+| 2 Feasibility evidence | **17** (timing: **2.2**) | | 11 Residual risks | **15** |
+| 3 Decisions | 3 | | 12 Out of scope | **16** |
+| 4 `${}` grammar | 4 | | 13 Evolution | **14** |
+| 5 Platform evaluation | 5 | | 14 Format correspondence | **18** |
+| 6 Module layout | 6 | | 15 Impact map | **19** |
+| 7 Lock generation | 7 | | 16 Eager resolution / `install_dir` | **11** |
+| 8 Integration points | 8 | | 17 Limits as a pyconf replacement | **13** |
+| 9 Test strategy | 9 | | | |
+
 ---
+
+# Part I — What the feature is, and what it gains
 
 ## 1. Model
 
@@ -28,9 +56,676 @@ artifact SAT executes against, in the spirit of `Cargo.lock`.
 **Gate:** if any layer resolves to `.toml`, the whole config goes through the lock.
 A configuration that is 100% pyconf keeps today's in-memory lazy path, unchanged.
 
+## 2. What is gained
+
+### 2.1 Summary
+
+| gain | who benefits | evidence |
+|---|---|---|
+| **Configuration written in TOML**, at any of the six layers, with ordinary TOML tooling | configuration authors | D3. `MEDCOUPLING-master-native` migrated on 2026-09-29 loads identically to its pyconf: the only difference in `sat config -v APPLICATION` is `CONFIGURATION: True` → `{}`, which resolves the same |
+| **A file can be checked before anything runs**: `sat config --validate FILE.toml` | authors, CI | D18. Exit status 0/1; every violation reported in one pass, with its key path |
+| **Configuration errors surface at load, all at once**, naming key and expression, rather than one at a time mid-build | everyone who opts in | D12. Locking the corpus exposed two latent upstream bugs that block 40 of 162 applications (§11, U1/U2) |
+| **Faster commands** | everyone who opts in | §2.2. `read_lock` is 39× faster than a full build; `sat prepare`'s configuration work falls from 0.32 s to 0.01 s |
+| **SAT's implicit decisions are written down** | anyone debugging a build | §2.3. The lock records the platform, the section, the file, the directory and the archive SAT chose for every product |
+| **Nothing changes for pure-pyconf users** | existing users | §1 gate. Outputs verified byte-identical against a pre-change baseline (`plan/00-handoff.md`) |
+| **Two pre-existing defects fixed on the way** | everyone | The explicit-section guard in `src/product.py` fell back silently to `default`; it now raises, naming the closest sections. Extension slicing that truncated `.toml` names in `commands/config.py` and `commands/jobs.py` |
+
+What is **not** gained — a pyconf-free workspace, TOML written by SAT, booleans — is in §13.
+
+### 2.2 What the lock costs and saves, measured
+
+> **Implementation note.** Realised. `get_config` validates the lock after two files
+> (internal and local) and returns early, so a warm invocation reads **2 sources instead
+> of 12** on the test fixture and skips projects, application, products and user entirely.
+> `can_reuse` in `lock.py` does the validation: it checks the lock against the inputs the
+> lock itself recorded, which is what makes the check possible before any layer is read.
+> Measured end to end: `sat prepare TOMLBENCH` 0.23 s against `sat prepare APPLI_TEST`
+> 0.48 s, with one lock reused across all four of prepare's config builds.
+
+Every SAT command rebuilds the whole configuration from scratch
+(`src/salomeTools.py:430`), including sub-commands invoked through the runner API. The
+lock therefore replaces a repeated 461-file parse with a single JSON read.
+
+On `MEDCOUPLING-9.12.0`, 42 products:
+
+| operation | time | lock size |
+|---|---|---|
+| full `get_config` from pyconf | 0.081 s | — |
+| `read_lock`, one JSON file | **0.002 s** | 51 KB |
+| | **39x faster** | |
+
+On `SALOME-9.12.0-MPI`, 148 products, the product layer alone parses in 0.278 s, and
+`collapse_products` adds 0.005 s.
+
+The figure that matters is not one command but a delegating one. `sat prepare`
+(`commands/prepare.py:176-200`) calls `get_products_list` itself and then invokes
+`clean`, `source` and `patch` through the API — **four full configuration builds for one
+user action**:
+
+| | `sat prepare` |
+|---|---|
+| today, pyconf | 0.32 s |
+| via the lock | **0.01 s** |
+
+Two conclusions follow, and they shape §8's integration rather than merely justifying it.
+
+**The lock must be a file, not an in-memory cache.** Each sub-command is a separate
+rebuild, so nothing held in process survives to the next one.
+
+**`is_stale` runs four times per `sat prepare`**, which is why it compares mtime and size
+rather than hashing 294 product files — the check has to be cheaper than the work it
+avoids, four times over.
+
+It also means **removing the four rebuilds is not the fix**. Passing one configuration
+down from `prepare` to its delegates would save ~10 ms once the lock exists, while
+introducing a re-entrancy requirement nothing in SAT has today: `get_product_section`
+mutates the tree for incremental products, so the second command would see the first
+command's overlay. Making repeated work cheap beats making the control flow cleverer.
+
+### 2.3 What the lock makes explicit
+
+SAT resolves configuration lazily: a value is computed when a command first reads it, in
+whatever context that read happens, and the result is never recorded. The lock replaces
+that with one written answer. Every choice SAT would otherwise make silently becomes a
+value that can be read, diffed and questioned.
+
+Observed on the lock of `MEDCOUPLING-master-native`, generated on UB24.04 on 2026-09-29
+from the manual-test TOML: 44 products, 49 source files, 87 KB.
+
+| # | implicit decision in SAT | what the lock records | example |
+|---|---|---|---|
+| 1 | **Which platform this is.** `VARS.dist` decides which `__overwrite__` blocks fire | `dist` in the header; the overwrites already applied, and `__overwrite__` itself gone | `swig` is `4.0.2`: the UB24.04 block fired |
+| 2 | **Which section of each product file applies.** The version→section mapping in `get_product_section`, including its fallback to `default` for incremental products | `__section__` on every product (D8) | `hdf5 → version_1_14_6`, `MEDCOUPLING → default_MPI`. **`swig 4.0.2 → default` and `cmake 3.31.6 → default`**: no dedicated section exists, so SAT falls back silently. Invisible in pyconf |
+| 3 | **What a bare product name means** | the version, spelled out | `CONFIGURATION.version = "master"`, i.e. `APPLICATION.tag` |
+| 4 | **Which product file wins on `PRODUCTPATH`.** First match wins; projects can override each other's products | `from_file` | the exact file for each of the 44 products |
+| 5 | **Where everything goes.** `LOCAL.workdir: default` means "parent of SAT"; install in the base or in the workdir | absolute `source_dir`, `build_dir`, `install_dir`; `install_mode`, `install_dir_save` | `install_dir_save: base` but `APPLICATION.base: no`, so all 44 install into the workdir |
+| 6 | **Where each source comes from** | `get_source`, and `archive_info.archive_name` resolved against the archive directories | 37 native, 5 archive, 2 git. hdf5, med, scotch and swig resolve to files in `ARCHIVES/`. **`cmake-3.31.6.tar.gz` stays a bare name: not present locally**, so `sat prepare` must fetch it or fail — visible before any build starts |
+| 7 | **Application flags inherited by each product** | `debug`, `verbose`, `dev`, `hpc` on every product | `hpc: yes` on MEDCOUPLING and scotch only |
+| 8 | **Which files contributed.** Including layers the user never names | `sources`: path, mtime, size of every file read | 49 files, including `src/internal_config/salomeTools.pyconf` and the user's `~/.salomeTools/SAT.pyconf` |
+| 9 | **Which machine this is** | `VARS`: `hostname`, `nb_proc`, `python`, `user` | why the lock is machine-local and never committed (D6) |
+
+Rows 2 and 6 are the diagnostic value in practice: a silent fallback and a missing archive,
+both readable before any compilation.
+
+To read a lock: `python3 -m json.tool <LOCAL.workdir>/.sat/<APPLICATION>.lock.json`, or with
+`jq`, `.PRODUCTS[] | {name, __section__, version, from_file}`.
+
+### 2.4 What the lock still leaves implicit
+
+| decision | why it is not in the lock | open item |
+|---|---|---|
+| **Which git server is cloned** | all three repository URLs are stored, resolved; the choice is made at clone time from `APPLICATION.properties.git_server` | O7 |
+| **Which commit** | `version: master` is a moving branch. The lock pins the *configuration*, not the *sources*: unlike `Cargo.lock`, two builds from one lock on different days can compile different code | O7 |
+| **Whether native products are installed** | `system_info` lists the expected packages; nothing checks them. That is `sat config --check_system`, run separately | — |
+| **Booleans in product files** | `MEDCOUPLING.properties.has_unit_tests: true` comes from a bare key in `MEDCOUPLING.pyconf`. D10 governs TOML input only, so pyconf product files still produce the value D10 forbids | O10 |
+
 ---
 
-## 2. Feasibility evidence
+# Part II — Architecture decisions (settled)
+
+## 3. Decision register
+
+D1–D10 were decided before implementation; D11–D20 were decided while building it. Anything still open is in §12, not here.
+
+### 3.1 Design decisions
+
+| # | Decision | Rationale |
+|---|---|---|
+| D1 | TOML expresses references as shell-style `${SECTION.key}`, converted at load into `pyconf.Reference` / `Expression` objects | Reads well for the newcomer audience the feature targets; needs no pyconf internals |
+| D2 | `JsonWriter` has two modes: **resolved** (the lock, default) and **raw** (`--raw`, templates preserved) | Resolved serves the runtime; raw is a diagnostic for inspecting templates pre-resolution |
+| D3 | TOML is accepted at **all six layers** (INTERNAL, LOCAL, PROJECTS, APPLICATION, PRODUCTS, USER) | Uniform; no rule about where TOML is allowed |
+| D4 | Both `X.pyconf` and `X.toml` for one layer is a **fatal error** naming both paths. SAT **refuses to write** a TOML-sourced layer | Silent precedence is exactly how two files drift apart unnoticed — the "double parsing" pitfall from the prompt |
+| D5 | Parser is stdlib `tomllib` only. Python < 3.11 raises a clear error pointing at `.pyconf` | Zero dependencies; no parser code we own |
+| D6 | The lock is **machine-local and gitignored**, fully resolved (fully: see D11) | A resolved SAT config contains absolute paths, distro tag and user name — it is not portable, so it must not pretend to be |
+| D7 | The lock is **platform-evaluated**: products are collapsed to their single applicable section, other platforms discarded | See §5 — this is what removes the eager-resolution hazard |
+| D8 | Collapsed products are stored **flat with a `__section__` marker**; `get_product_config` gains an early branch to use them verbatim | The platform decision is made exactly once, so runtime cannot diverge from the lock |
+| D9 | `src/pyconf.py` is **not modified** | Hard constraint from the prompt |
+| D10 | A `bool` is valid **only** inside `APPLICATION.products`, and only as `true`. The canonical spelling of a product with no overrides is `{}`; `true` is an accepted alias; `false` is refused. Booleans anywhere else raise, naming the key | A bool never equals a str, so `debug = true` fails `== "yes"` (`src/compilation.py:59`) and reads as **off**, while `SMESH = false` passes `isinstance(version, bool)` (`src/product.py:77`) and reads as **enabled** -- both silently, in opposite directions. Coercion would need a complete list of yes/no-typed keys, which `properties` (open-ended, shared with product files) makes impossible to maintain; rejection needs no list. `{}` routes through the Mapping branch to the same `version = APPLICATION.tag` with no value to mistype. Two properties worth recording, since both are easy to re-open later: the rule is **positional**, so a bool reaching the products position by the `__overwrite__` dotted-key route (`"APPLICATION.products.SMESH" = false`) is refused too, where coercion would have silently assigned the *version string* `"no"`; and rejection is the **reversible** choice -- a file written under the strict rule stays valid if the rule is later relaxed to coercion, whereas a file written under coercion breaks if the rule is ever tightened. Measured cost to the corpus: zero. Across the 162 application files there is no bool anywhere outside `APPLICATION.products.<name>`, and none in any `__overwrite__` assignment. The cost is ergonomic -- see §14 |
+
+### 3.2 Decisions taken during implementation
+
+Each was forced by something found while building, and is recorded here so it is not
+re-derived or re-litigated.
+
+| # | Decision | Rationale | Where |
+|---|---|---|---|
+| D11 | `collapse_products` calls **`get_product_config`**, not only `get_product_section`, so the lock stores derived values such as `install_dir` | 521 `$install_dir` references in 33 product files resolve only after runtime derivation; *calling* the existing derivation is not duplicating it | §11 (option 2), `lock.py` |
+| D12 | A value that will not resolve **aborts lock generation, reporting every failure** grouped by cause, not the first | Load-time errors beat mid-build ones; stopping at the first hid that 36 failures shared one cause | §11, `writers.JsonWriter` (`ConfigResolutionError`) |
+| D13 | The lock key includes the **`-o` overrides**, alongside sources, `dist`, application and `sat_version` | The public GitHub workflow overrides the in-file Tuleap default with `-o`; a lock keyed on files alone would serve Tuleap URLs to a GitHub run | `lock.can_reuse`, `lock.is_stale` |
+| D14 | The lock lives at **`<LOCAL.workdir>/.sat/<APPLICATION>.lock.json`**, is written atomically (temporary file + `os.replace`), and is written only for a configuration with an application **and** a TOML layer | Settles the location §7 left open. Atomicity: `sat jobs` can run SAT processes concurrently on one workdir. No application means nothing product-shaped to lock | `lock.write_lock`, `lock.lock_path`, `commands/config.py` gate |
+| D15 | **Fast path**: `get_config` validates an existing lock against the sources *the lock itself recorded* after reading only the internal and local layers, and returns it. `VARS` is never served from the lock | Makes a warm run read 2 files instead of 12. A pure-pyconf configuration never writes a lock, so the fast path cannot fire for it. `VARS` holds `datehour` and `command`, which name the log files — served stale, every run overwrote the previous log (review B1) | `lock.can_reuse`, `ConfigManager._adopt_lock` |
+| D16 | Ambiguity (D4) is **per directory**. The same layer name in two directories of a search path is ordinary precedence, first wins | Checking across the search path would break every project that overrides a product | `discovery.resolve_layer` |
+| D17 | **`.json` is never discovered as a layer**, though `JsonReader` can read one | A lock carries another machine's absolute paths; being able to read a format and choosing to look for it are separate decisions | `discovery.LAYER_EXTENSIONS` |
+| D18 | **`sat config --validate FILE`** checks only what the file alone determines — TOML grammar, `${}` grammar, D10, no dates — using `TomlReader`'s own leaf check. References are not resolved, products not looked up | A validator that needed the other layers would be a second loader. Reusing the reader's check means a message from `--validate` is the one loading would raise. `-v` was not available: it is the global verbose option | `configio/validate.py`, `commands/config.py` |
+| D19 | **`sat config -l`, `-e`, `-c` find application files with the same discovery as loading.** `-c` keeps the source's format and refuses a name existing in either format | They looked for `.pyconf` only, so a TOML application loaded but could not be listed, edited or copied (manual test, 2026-09-29). The listing keeps its pre-TOML file-name order | `application_names`, `find_application_file`, `copy_destination` in `commands/config.py` |
+| D20 | The **four configuration builds of `sat prepare` are kept** | The lock makes each cheap (0.32 s → 0.01 s); passing one tree down would require re-entrancy `get_product_section` does not have, since it mutates incremental products | §2.2 |
+
+### 3.3 D5 note — the version constraint is softer than it looks
+
+`tomllib` is stdlib only from Python 3.11, while SAT runs on the system Python of
+every supported distro (`src/internal_config/distrib.pyconf`: CO/DB/FD/UB/MG/OS —
+Rocky 9 = 3.9, Ubuntu 22.04 = 3.10, Debian 11 = 3.9).
+
+But under the model in §1, **only the machine that generates the lock parses TOML**.
+Build machines consume JSON, which is stdlib on every version. Old-Python platforms
+can therefore consume locks; they simply cannot author from TOML.
+
+## 4. The `${}` grammar
+
+Minimal by design — it expresses what the corpus uses and nothing more.
+
+```toml
+source_dir    = "${APPLICATION.workdir}/SOURCES/${name}"
+compil_script = "${name}${VARS.scriptExtension}"
+archive       = "boost-${APPLICATION.products.boost}.tar.gz"
+literal       = "costs $${100}"    # -> literal "${100}"
+```
+
+- `${A.b.c}` and `${A["x"]}` become `pyconf.Reference`
+- adjacent parts become `pyconf.Expression(+, ...)`
+- `$${` escapes a literal `${`
+- an unterminated `${` is a **parse error**, never silently literal
+- a string with no `${` is a plain string — no scan, no surprises
+
+## 5. Platform evaluation (D7) — and the hazard it removes
+
+### The hazard
+
+`Reference.resolve` (`src/pyconf.py:932`) raises `ConfigResolutionError` when a
+reference cannot be found, and resolution today is **lazy** — it happens on
+attribute access, in whatever container context that access occurs.
+
+Writing a fully-resolved lock means resolving the entire tree **eagerly**, which is
+strictly more demanding than anything SAT does today. Every product file carries
+platform-specific sections that are inert on the current machine, e.g. in
+`boost.pyconf`:
+
+```
+default_win :
+{
+   compil_script : "boost_V" + $APPLICATION.products.boost + ".bat"
+   archive_info : {archive_name : "boost-" + $APPLICATION.products.boost + "_windows.tar.gz"}
+}
+```
+
+Nothing reads `default_win` on Linux today, so that reference is never evaluated.
+
+### The resolution
+
+SAT **already** discards non-matching platforms at merge time.
+`__overwrite__` / `__condition__` (`src/pyconf.py:1614`) is evaluated against the
+current machine:
+
+```
+__condition__ : "VARS.dist in ['CO9']"
+__condition__ : "VARS.dist in ['FD32', 'UB20.04']"
+__condition__ : "VARS.dist in ['CO7'] and APPLICATION.environ.build.VTK_SMP_IMPLEMENTATION_TYPE == 'TBB'"
+```
+
+So the merged tree is already platform-specific. What remains un-collapsed is only
+the per-product section family (`default`, `default_win`, `version_1_71_0`,
+`version_1_71_0_UB22_04`, …), collapsed later by `get_product_section`
+(`src/product.py:395`).
+
+**Running that collapse during lock generation, rather than at runtime, means
+`default_win` is *dropped* on Linux rather than evaluated.** The eager-resolution
+hazard disappears, and the lock becomes far smaller — one section per product
+instead of the ~15 in `boost.pyconf`.
+
+The lock is consequently platform- *and* application-specific, which is consistent
+with D6.
+
+> This revises an earlier position that the lock would mirror the config tree only.
+> It now bakes in the platform/section decision, which is `product.py` territory.
+
+## 6. Module layout
+
+New package `src/configio/`. Nothing outside it imports `tomllib`.
+
+| file | responsibility |
+|---|---|
+| `readers.py` | `Reader` ABC; `PyconfReader` (delegates to `src.pyconf`), `TomlReader`, `JsonReader`. Each returns a `src.pyconf.Config`. |
+| `writers.py` | `Writer` ABC; `JsonWriter` (resolved / raw, collects every failure — D12), `PyconfWriter` (wraps existing `__save__`); `writer_for_layer`, which raises `TomlWriteRefused` for a TOML-sourced layer (D4). No `TomlWriter` (O1). |
+| `interp.py` | `${...}` grammar → `Reference` / `Expression`. The only new parser we own. |
+| `discovery.py` | layer resolution; the two-files-one-layer error (D4, per directory — D16); `LAYER_EXTENSIONS` (D17). |
+| `lock.py` | platform collapse through `get_product_config` (D11) → atomic write / read of the lock; `is_stale`, `can_reuse` (D13–D15). |
+| `keys.py` | `LOCK_KEY`, `SECTION_KEY`. A leaf module importing nothing, which breaks an import cycle through `src/__init__.py` → `product` → `configio`. |
+| `validate.py` | `validate_toml`, behind `sat config --validate` (D18). |
+
+`readers.py` only *constructs* pyconf's public classes — it does not modify them (D9).
+A `Config` rebuilt from a lock is a real `src.pyconf.Config`, so `product.py`,
+`environment.py` and every command keep working unchanged; they see plain strings
+where `Reference` objects used to be, which is what those resolve to anyway.
+
+### On the `Reader` factory in the prompt
+
+The prompt sketches one `Reader` ABC with three children, the TOML child lacking
+`write`. A child that raises `NotImplementedError` on half its interface is a sign
+the read and write axes want separating — hence `Reader` **and** `Writer` above:
+
+```
+Reader : PyconfReader, TomlReader, JsonReader
+Writer : PyconfWriter, JsonWriter
+```
+
+Read-capable = {pyconf, toml, json}; write-capable = {pyconf, json}. No crippled child.
+
+## 7. Lock generation
+
+- **Location:** `<LOCAL.workdir>/.sat/<APPLICATION>.lock.json` (D14), written atomically; created `0600` today (O4)
+- **Content:** merged tree with `__overwrite__` applied by the existing merger, then
+  each product collapsed via `get_product_config` (D11) into a flat block carrying `__section__`
+- **Staleness:** header records `sat_version`, `VARS.dist`, application name, the `-o`
+  overrides (D13), and `(path, mtime, size)` for every source file consumed. Any mismatch
+  regenerates. `sat --relock <command>` forces.
+- **Reuse:** the fast path (D15) validates the lock before reading the other layers; `VARS`
+  is always this invocation's.
+- **Shape:**
+
+```json
+{
+  "__lock__": { "sat_version": "5.x", "dist": "UB24.04", "application": "MYAPP",
+                "sources": [["applications/MYAPP.toml", 1756800000, 812]],
+                "overrides": [] },
+  "PRODUCTS": {
+    "boost": {
+      "__section__": "version_1_71_0",
+      "name": "boost",
+      "patches": [],
+      "source_dir": "/home/flo/ws/MYAPP/SOURCES/boost"
+    }
+  }
+}
+```
+
+## 8. Integration points
+
+| file | change |
+|---|---|
+| `commands/config.py` `get_config` | the 6 load sites go through `discovery.resolve_layer`; the fast path after the LOCAL layer (`lock.can_reuse` → `_adopt_lock`, D15); the TOML gate and `_through_lock` at the end |
+| `commands/config.py` `run` | `--validate` (D18); `-l`, `-e`, `-c` through `application_names`, `find_application_file`, `copy_destination` (D19) |
+| `commands/config.py` `create_config_file`, `commands/init.py` (3 sites) | refuse to write a TOML-sourced layer, naming file and key (D4, `writer_for_layer`) |
+| `src/product.py` `get_product_config` | early branch on `__section__` (D8); the explicit-section guard raises with the closest section names |
+| `commands/jobs.py` | `.toml`-safe name handling; no refusal, since it writes a temporary aggregate |
+| `src/salomeTools.py` | global `--relock` option |
+| `.gitignore` | `.sat/`, `*.lock.json` |
+
+An earlier version of this section stated these were the only writers of configuration.
+They are not: there are 12 `Config.__save__` call sites outside `pyconf.py`, including 4 in
+`commands/package.py` (§19 C1, O1).
+
+## 9. Test strategy
+
+**Status (2026-09-29):** 325 unit tests in `test/test_036`–`test_050`, run from `test/`. The
+acceptance test below has not been run; `plan/manual_test.md` is its first step, on
+`MEDCOUPLING-master-native`.
+
+The strongest asset is an **equivalence oracle**: `test/APPLI_TEST/APPLI_TEST.pyconf`
+translated to TOML, asserting both paths produce identical resolved trees. Every
+existing SAT behaviour then acts as a test for the TOML path.
+
+- **Unit** (TDD, written first): `${}` grammar including escapes and malformed input;
+  each reader/writer in isolation; ambiguity detection (D4); the `tomllib` version guard (D5).
+- **Integration:** write a TOML app → `sat config -v` → `sat compile`, following the
+  real user workflow.
+- **Roundtrip:** (a) TOML artefact ≡ pyconf artefact — the oracle above;
+  (b) `pyconf → json → Config` equivalence at resolved-value level.
+- **Second pass**, driven by *"what could fail without the user knowing immediately?"* —
+  candidates: a stale lock silently used after a source edit; a product collapsing to
+  the wrong section on an untested distro; `$${` mis-escaped so a literal becomes a reference.
+- **Final acceptance** (performed by the user, not this work): compile one SALOME
+  application from a TOML configuration.
+
+## 10. Rejected alternatives
+
+| Rejected | Why |
+|---|---|
+| Keep verbatim pyconf expression syntax inside TOML strings | Mechanical migration, but opaque to TOML tooling and depends on a pyconf internal entry point |
+| JSON as resolved-only, or raw-only | Resolved-only breaks the roundtrip requirement; raw-only defeats the "bash can parse it" motivation |
+| Committed, machine-independent lock | A resolved SAT config is machine-specific; a portable lock would require classifying every key as portable or local |
+| **Structured reference arrays** (`workdir = [{ref="LOCAL.workdir"}, ...]`) instead of `${}` strings | TOML parses the structure, so no string grammar is needed and values become machine-checkable -- but it is unpleasant to write for the common case, still needs a resolver, and would have to apply to all 8 reference paths including `products.cgal.tag`, where it is absurd |
+| **Forbidding references in TOML**, resolving everything at lock time | `${workdir}` inside `environ.build` refers to a sibling key in the same file; there is no earlier point at which SAT could compute it. The user would be asked to paste an absolute path |
+| **Alternative delimiters** (`{LOCAL.workdir}`, `@LOCAL.workdir`) | Cosmetic. `${}` is safer because `{` occurs in values such as `cmake_generator` and in CMake-flavoured strings generally |
+| **Defaulting `workdir` in SAT code** and omitting it from TOML | Tempting -- 162 files carry only two formulas, so it is a convention wearing a costume. But `$VARS.sep` is `os.path.sep` (`commands/config.py:148`) and is referenced 614 times across the corpus, so the grammar is required by the other 151 files regardless. Removing `workdir` would save one key while keeping the whole parser, and would make the TOML and pyconf layers express the same thing differently -- the divergence §9's oracle exists to catch. Revisit as a follow-up, not as part of this feature |
+| Vendored TOML parser, or `tomli` dependency | A subset parser that mis-reads valid TOML is a real hazard; a pip dependency fails on a fresh git clone. §3 D5 shows the constraint is soft |
+| **Universal lock pipeline** (all configs, including pure pyconf) | Imposes eager resolution on all 461 existing config files; `ConfigResolutionError` is a hard raise, so this surfaces latent failures in configs that work today |
+| **Sidecar lock** (written but never read back) | Contradicts the model — the lock would be a report, not the execution artifact |
+| Baking `get_product_config`'s full derived output (install_dir, dependency order) into the lock | Duplicates ~300 lines of logic into the lock schema, which can then drift. Only the *section* decision is baked (D7/D8) |
+
+## 11. Decision record — eager resolution and `install_dir` (D11, D12)
+
+**Status: DECIDED — option 2. Implemented in Task 8; `collapse_products` calls
+`get_product_config`. See "Outcome" at the end of this section.**
+
+### What happens
+
+Building a real configuration with the real `get_config`, collapsing it, then writing it
+with `JsonWriter(resolved=True)`:
+
+| application | products | result |
+|---|---|---|
+| `MEDCOUPLING-9.12.0` | 42 | succeeds — 51 KB lock |
+| `SALOME-9.12.0-MPI` | 148 | **fails** |
+
+```
+ConfigResolutionError: unable to evaluate $install_dir
+in the configuration default.environ
+```
+
+### Why it is structural, not a bug
+
+`install_dir` appears in no product file. `get_product_config` computes it by calling
+`get_install_dir` at runtime and attaches it to the product info it returns. A product
+whose `environ` block references `$install_dir` therefore holds a reference that resolves
+only *after* runtime derivation — while the writer runs before it, by construction.
+
+| reference | occurrences | files | resolvable at lock time |
+|---|---|---|---|
+| `$install_dir` | **521** | **33** | **no** — attached by `get_install_dir` at runtime |
+| `$name` | 1114 | 274 | yes — `name` is a key in the section |
+
+Collapsing does not help: this is not a platform-dead section (§5) nor a latent broken
+reference (§19 B2). It is a reference into a value that does not exist yet, by design.
+
+Worth noting how it was nearly missed: `MEDCOUPLING-9.12.0` contains none of those 33
+products, so it locks cleanly. Validating against one application would have shipped it.
+
+### The options
+
+| # | option | what changes | cost |
+|---|---|---|---|
+| **1** | **Partial lock.** Leave `environ` blocks unresolved in the lock; `environment.py` resolves them at runtime as it does today | §4, §7; Task 5 gains a per-region mode; Task 6 must revive pyconf `$`-syntax inside those regions | The lock stops being uniformly resolved, so it has two modes in one document. Directly reverses Task 6's rule that `JsonReader` parses no templates — a rule that exists to stop a raw dump being loaded as an execution input. The "bash and jq can read it" motivation (§10) weakens wherever a value is still a template |
+| **2** | **Derive `install_dir` during collapse.** `collapse_products` calls `get_install_dir` and stores the result, so `$install_dir` resolves like any other key | D6, D8, §10; Task 8's `collapse_products` | Pulls one derived value into the lock, which §10 rejected for `get_product_config`'s output as a whole. That rejection was about **duplicating ~300 lines**; *calling* the existing function is not duplication — it is the same principle Task 8 already applies to `get_product_section`. `is_stale` gains a new reason to invalidate, since `install_dir` depends on `base` and `install_mode`, which can change with no source file changing |
+| **3** | **Exclude affected products.** Products with runtime-only references are not locked and fall back to the pyconf path | §1, D6 | Breaks the model: the lock is no longer the artifact SAT executes against, and a configuration is half locked. Rejected unless 1 and 2 both prove worse |
+| **4** | **Resolve nothing; lock raw only.** The lock becomes a normalised source cache, not an execution artifact | §1, §7, D2, D6 | Abandons the `Cargo.lock` model the feature is built on, and the eager-resolution benefit with it. Listed for completeness |
+
+### Recommendation
+
+**Option 2.** It keeps one representation, one resolution pass, and one implementation of
+the install-directory decision. The drift §10 feared comes from reimplementing a
+decision, not from invoking it — and Task 8 already establishes invoking as the pattern.
+Option 1 is the alternative worth taking seriously if pulling derived values into the
+lock proves to cascade: the moment `install_dir` is in there, the next reviewer will ask
+why `source_dir` and `build_dir` are not.
+
+The deciding question is narrow enough to state: **is `install_dir` part of the decision
+the lock records, or part of the work the lock feeds?** Option 2 says the former, option 1
+the latter. Nothing else in this document answers it.
+
+### Outcome
+
+Option 2 was taken. `collapse_products` calls `get_product_config` rather than
+`get_product_section`, so the lock stores the product info SAT actually derived --
+`install_dir`, `install_mode` and the rest -- and `$install_dir` resolves like any other
+key. One call, no reimplementation, the same principle Task 8 already applies to section
+selection.
+
+`get_product_config` keeps `install_dir_save` bookkeeping for repeat calls, so a second
+collapse adds that one key while every value stays identical. That is pinned by
+`test_collapsing_twice_changes_no_value`.
+
+**The `$install_dir` failure class is gone.** Locking all 162 applications:
+
+| | applications |
+|---|---|
+| lock cleanly | **116** |
+| fail | **46** |
+
+The 46 fall into three classes. **Two are genuine upstream configuration bugs; the third
+is an artifact of the measurement** and is not a bug at all:
+
+| apps | failure | verdict |
+|---|---|---|
+| 36 | `TypeError: can only concatenate str (not "bool") to str` | **bug** — see U1 below |
+| 4 | `AttributeError: Unknown pyconf key: 'version_6_1_0_MPI'` | **bug** — see U2 below |
+| 6 | `SatException: openssl has version 1.1.1n but is declared as native` | **not a bug** — Windows applications resolved on Linux. `openssl.pyconf` is incremental; `default` sets `get_source : "native"` and `default_win` overrides it to `"archive"`. On Windows the overlay yields `archive` and resolves correctly. Resolving a Windows application on Linux is not a supported operation, and the lock is platform-specific by construction (D7) -- so this is the measurement reaching somewhere it should not have |
+
+So **40 of 162 applications, 25%, are blocked by two fixable lines**, and the lock is what
+found them. Neither is a regression: each fails today too, later and with less context.
+
+### The two upstream fixes
+
+**U1 — `OPENTURNS_SALOME.pyconf`, `default` section: delete the `compil_script` line.**
+Affects 36 applications.
+
+```
+build_source  : "cmake"           # <- not "script"
+compil_script : $name + "-" + $APPLICATION.products.OPENTURNS_SALOME + $VARS.scriptExtension
+```
+
+The expression builds a script filename from the version the application requested. That
+idiom is correct for a **prerequisite** — 72 product files use it, and applications pin
+those versions. But `OPENTURNS_SALOME` is declared with a bare key in **all 46** of the
+applications that include it, and pinned in none, so the reference resolves to `True` and
+the concatenation cannot ever succeed.
+
+It has gone unnoticed because the key is **dead**: `build_source` is `"cmake"`, and
+`compil_script` is only read when `product_has_script()` is true, which requires
+`build_source.lower() == 'script'` (`src/product.py:1161`). Nothing reads the key, so its
+expression has never had to evaluate.
+
+Deleting the line is the right fix, not pinning a version: a cmake-built product has no
+compile script. It is dead configuration that happens to be wrong.
+
+*Scope check, because the obvious worry is that this is systemic:* of 55 products ever
+declared bare — including the 15 always-bare internally-developed ones such as `SHAPER`,
+`SHAPERSTUDY`, `YDEFX` and `PARAVISADDONS` — **`OPENTURNS_SALOME` is the only one whose
+file references `$APPLICATION.products.<self>`**. `KERNEL`, `GUI`, `GEOM` and `SMESH` are
+not even always-bare, and never name their own version. The modules are immune because a
+git checkout at the application tag never needs its version in a filename. The single
+cross-product reference in the corpus is `hdf5_openmpi` reading `hdf5`, which is pinned in
+161 of 162 applications. **One file using the prerequisite idiom while consumed as a
+module — not a class.**
+
+**U2 — `SALOME-10.0.0*.pyconf`: `ParaView` asks for a section that does not exist.**
+Affects 4 applications.
+
+```
+ParaView : {tag:'6.1.0.c61dcc8ee0', base:'no', section:'version_6_1_0_MPI', hpc:'yes'}
+```
+
+`ParaView.pyconf` defines `default`, `version_6_0_0`, `version_6_0_0_MPI`,
+`version_6_0_0_MPI_CO9`, `version_6_0_0_MPI_FD44` and `version_6_0_0_win`. There is no
+`version_6_1_0_MPI` anywhere in the corpus. An explicit `section:` bypasses version
+matching entirely (`src/product.py:429`), so the miss is immediate rather than falling
+back to `default`.
+
+### Consequent open question
+
+What should lock generation do when a configuration has a latent error of this kind?
+
+- **Abort, naming the key and the expression.** Strictly more useful than today's failure,
+  which arrives during a build. But 28% of applications cannot adopt TOML until their
+  configuration is fixed -- and 36 of them need one line changed in one product file.
+- **Resolve what resolves, keep the rest raw.** Preserves today's behaviour exactly: the
+  broken value fails when read, not before. Reintroduces option 1's two-modes problem.
+
+**Decided: abort — but report every failure, not the first.**
+
+Aborting is right: a latent error found at load time, with the key and the expression
+named, beats the same error arriving mid-build. But dying on the first unresolvable value
+is what made this investigation expensive. The first run reported one `TypeError` with no
+indication that 35 other applications shared one cause, or that a second, unrelated bug
+accounted for 4 more, or that 6 of the failures were not bugs at all.
+
+So lock generation **collects** unresolvable values and reports them together:
+
+- group by cause, not by application — one entry for U1, not 36
+- name the key path, the expression, and the value that broke it
+  (`$APPLICATION.products.OPENTURNS_SALOME` resolved to `True`)
+- state the count of affected layers or products
+
+Same strictness, and the first encounter becomes an actionable list instead of a puzzle.
+This shapes Task 10's error path, and Task 5's writer needs to surface per-value failures
+rather than letting the first exception escape.
+
+---
+
+# Part III — Not yet decided, and where the feature stops
+
+## 12. Open decisions
+
+Each item needs a **decision**, not only work: there are at least two defensible answers.
+Sources are the review (`plan/12-review.md`) and the manual test (`plan/manual_test.md`),
+both of 2026-09-29. Items marked *observed* were reproduced; *unverified* ones come from
+reading the code.
+
+| # | question | why it matters | options | source |
+|---|---|---|---|---|
+| **O1** | **Does SAT write TOML?** Inverts D4 | Without a writer, `sat package` silently ships pyconf for a TOML source and `sat init` cannot create a TOML layer, so no workspace can be pyconf-free | keep D4, and C1/C2 are permanent limits · serialise from the tree for generated files (package) · text-level editing for user files (init) | §13, `plan/13-extended-feature.md` |
+| **O2** | **Should the fast path detect a second file beside a locked layer?** | *Observed:* with a fresh lock, putting `X.pyconf` back beside `X.toml` is silently ignored — the lock is served. Without the lock, the same state is fatal (D4). The rule currently depends on cache state | re-run discovery on the fast path (a few `stat` calls per layer) · record "no sibling" in the lock · accept and document | manual test F2 |
+| **O3** | **How is the ambiguity error shown?** | *Observed:* `commands/config.py:584` rewraps `AmbiguousLayerError` as `Error in configuration file: X.pyconf`, naming one file and not the ambiguity; the real message is only in the chained traceback. Separately, every `SatException` prints as a bound method (legacy L5) | let `AmbiguousLayerError` through the rewrap · fix L5 for all errors (wide blast radius) | manual test F1, review S4/L5 |
+| **O4** | **Who may read the lock?** | *Observed:* the lock is created `0600` (the atomic write of D14 uses `mkstemp`). On a workdir shared between users, or read by `sat jobs` under another account, it is unreadable | apply the umask default on write · keep `0600` and document | manual test §4 |
+| **O5** | **Should an unquoted `__overwrite__` target be rejected?** | *Unverified:* `APPLICATION.products.swig = "4.0.2"` unquoted nests into tables; `ConfigMerger.overwriteKeys` then assigns the whole `APPLICATION` section — on the matching distributions only | reject non-dotted keys inside `[[__overwrite__]]` in `TomlReader` and `--validate` · document only | manual test F5, §17 consequence 3 |
+| **O6** | **Should D10's positional rule see through dotted keys?** | A bool inside `[[__overwrite__]]` is refused with the generic message, and `"APPLICATION.products.X" = true` is refused although `X = true` is accepted | treat a dotted target as its path · keep refusing, fix the message | §3 D10 |
+| **O7** | **What should the lock pin?** | It pins configuration, not sources: the git server is chosen at clone time, and `master` is a branch (§2.4) | record the chosen repository URL · record the commit after `sat prepare` (a source lock) · neither | §2.4 |
+| **O8** | **Key paths change after migration** | *Observed:* `sat config -v PRODUCTS.MEDCOUPLING.default.git_info…` works on pyconf and fails after migration, because the lock collapsed sections (D7); `PRODUCTS.MEDCOUPLING.git_info…` works only after. Scripts using section paths break | document as part of §19 B3 · keep the section level in the lock | manual test P2 |
+| **O9** | **Should the silent `default` fallback warn?** | The lock shows `swig 4.0.2` and `cmake 3.31.6` resolving to `default` because no version section exists (§2.3 row 2). SAT has always done this silently | warn at lock time when a pinned version falls back · leave it visible in the lock only | §2.3 |
+| **O10** | **Booleans in product files** | D10 applies to TOML only; `has_unit_tests` as a bare pyconf key reaches the lock as `true`, and `"no"` still runs tests (legacy L2) | extend the rule when product files migrate · leave with legacy L2 | §2.4, review L2 |
+| **O11** | **`yes`/`no` → booleans** | The ergonomic cost of D10 | the staged path in §14 | §14 |
+| **O12** | **A declared schema** | The key inventory in §17 is measured, not enforced; a schema is what would let `--validate` check key names and types | write one · stay with measured inventory | §14 |
+| **O13** | **Upstream fixes U1/U2** | Two lines in `SAT_SALOME` block 40 of 162 applications from locking. Not SAT's code; the owners decide | fix upstream · leave those applications on pyconf | §11 |
+
+Pre-existing SAT defects found along the way (L1–L5) are recorded in `plan/12-review.md` and
+are outside this feature unless one becomes an item above, as L5 does in O3.
+
+## 13. Limits as a pyconf replacement
+
+This feature makes TOML a supported **input** format. It does not make TOML a replacement
+for pyconf, and the gap is deliberate rather than unfinished. If the objective becomes
+full replacement, D4 and §16 are what have to change first; `plan/13-extended-feature.md`
+plans that work.
+
+### What is replaced
+
+| | status |
+|---|---|
+| reading a configuration layer | TOML at all six layers (D3) |
+| `${}` interpolation | §4, layered onto TOML as a string convention |
+| the object model | unchanged — every reader produces `pyconf.Config` |
+| the execution artifact | the JSON lock (§1), for any configuration with a TOML layer |
+
+### What is not
+
+**SAT cannot write TOML.** D4, enforced by `writers.writer_for_layer`, which raises
+`TomlWriteRefused`. The consequences are concrete rather than theoretical:
+
+| command | consequence |
+|---|---|
+| `sat init --base`, `sat init --add_project` | refuses against a `local.toml`; the user edits the file themselves |
+| `sat config` first run | can create `SAT.pyconf`, never `SAT.toml` |
+| `sat package` | regenerates `local.pyconf` and `<product>.pyconf` into the archive, **silently converting a TOML-sourced configuration to pyconf** (impact map C1) |
+
+So a workspace cannot today be **pyconf-free**: `sat init` needs to write somewhere, and
+`sat package` emits pyconf regardless of what it read.
+
+### Why writing is the hard half
+
+Not a matter of effort ordering. Three facts, each verified:
+
+1. **`tomllib` is read-only.** It exports `load`, `loads` and `TOMLDecodeError` and
+   nothing else. Writing was left out of it, and an external writer such as `tomli_w`
+   violates the zero-dependency constraint (§3). Any TOML writer is written from scratch.
+2. **`tomllib` discards comments.** A `Config` built from TOML has none, so serialising
+   the tree back out cannot restore them. pyconf's `Config.__save__` *does* keep comment
+   content — it relocates a trailing comment onto its own line, but does not lose it. A
+   TOML writer that serialises from the tree is therefore strictly worse than the format
+   it replaces, for files humans maintain.
+3. **A `${}` re-serialiser does not exist.** `interp.parse_template` turns
+   `"${A.b}/x"` into `Reference`/`Expression`; nothing goes the other way. The lock's raw
+   mode emits pyconf `$`-syntax on purpose (§4), as a diagnostic, not as TOML.
+
+Preserving comments therefore needs **text-level editing of the original file**, which
+means a second, position-aware TOML scanner alongside `tomllib` — and two parsers that
+can disagree about one document.
+
+### The limit that is not about writing
+
+A TOML-only workspace still cannot escape the `yes`/`no` convention. SAT compares against
+those strings at 58 sites across 14 files, so `debug = true` reads as `"no"` (D10). That is
+independent of the writer and is planned separately in §14.
+
+### Summary
+
+| objective | status |
+|---|---|
+| accept TOML input | **done** |
+| execute against a generated artifact | **done** (the lock) |
+| leave pyconf configurations untouched | **done**, verified byte-identical |
+| author a configuration entirely in TOML | partial — readable, not writable |
+| a pyconf-free workspace | **not possible** — `sat init` and `sat package` both write pyconf |
+| booleans instead of `yes`/`no` | **no** — §14 |
+
+## 14. Evolution — if SAT detaches further from pyconf
+
+Several decisions here are shaped by one constraint: the object model and the value
+conventions are pyconf's, because 461 files and every consumer in `src/` and
+`commands/` assume them. That constraint is not permanent, and D10 in particular is
+the visible cost of it. If pyconf ever stops being the lingua franca, the following
+becomes available — in this order, because each step makes the next one safe.
+
+**Step 1 — grow the oracle into coverage.** §9's differential test exists to compare
+two loaders. Its more valuable second life is as the regression net that `src/product.py`
+and `src/environment.py` have never had: 11 test files today, 3 of which touch either.
+Nothing below should be attempted before that net exists.
+
+**Step 2 — centralise the yes/no test.** 58 direct `== "yes"` / `== "no"` comparisons
+across 14 files (`src/product.py` 19, `commands/package.py` 11, `src/environment.py` 10),
+plus the two helpers `appli_test_property` and `product_test_property` already used at
+33 call sites. Route all of them through one predicate that accepts `True` and `"yes"`
+alike. This is mechanical and behaviour-preserving: pyconf files keep passing strings
+and keep working.
+
+Note the hidden half. Values are not only compared, they are **emitted** —
+`src/environment.py:896` writes `pi.base` straight into a generated environment, and
+formats it into a `module load` line two statements later. Emission sites cannot be
+found by grepping for a comparison; they look like ordinary variable use, so this step
+is an audit by reading, not by pattern.
+
+**Step 3 — relax the reader.** Only once steps 1 and 2 hold can `_convert_bool` start
+returning `True` where it currently raises. This is why D10 rejects rather than coerces:
+every TOML file written under the strict rule is still valid the day the rule loosens,
+so no user's configuration is invalidated by the change. Coercing today would spend
+that option for an ergonomic gain available later anyway.
+
+**What would still not follow.** Two residuals survive any amount of detachment,
+because neither is about pyconf:
+
+- `environ` is an open key space whose values become environment variables. `true`
+  rendered as `"yes"` may not be what the consuming program wants — the corpus writes
+  `SALOME_USE_64BIT_IDS = "1"`. No rule infers the right spelling; only the author knows.
+- Distinguishing a bool typed into a string-valued key (`tag = true`) from a bool meant
+  as a flag requires knowing which keys are string-typed. That is a **schema**, and §17's
+  inventory is measured from the corpus rather than declared. Writing that schema down
+  is the prerequisite, and it is a larger piece of work than anything above — it is also
+  what would let TOML tooling validate a SAT configuration before SAT ever reads it.
+
+## 15. Residual risks
+
+1. **Migration is all-or-nothing per configuration, not per file.** Converting one
+   file routes that user's remaining pyconf files through the lock. The platform
+   collapse (§5) removes the reference hazard, but this is a larger behavioural step
+   than "I changed one file" suggests. Must be stated in user documentation.
+2. **`get_product_section` has real subtlety** — incremental mode, version *ranges*
+   via `getRange_majorMinorPatch`, `_win` overlays. The lock generator must **call**
+   it, never reimplement it.
+3. **Windows** — the `default_win` collapse path cannot be tested on this machine.
+4. ~~Lock location (§7) is an unconfirmed assumption.~~ Settled by D14.
+5. **Test fixture fragility.** `test_045` writes TOML fixtures into `test/APPLI_TEST/`,
+   which is on `APPLICATIONPATH`. An interrupted run leaves one behind. Intermittent single
+   failures have been seen twice and not pinned down. Fix: point those tests at a temporary
+   `APPLICATIONPATH`.
+
+## 16. Out of scope (YAGNI)
+
+Backtick evaluation, `@include`, arithmetic beyond `+`, a TOML writer (reopened as O1), a vendored
+TOML parser, a `RESOLVED` convenience section for jq, and committed portable locks.
+
+---
+
+# Part IV — Reference
+
+## 17. Feasibility evidence
 
 Measured against the real corpus: 461 `.pyconf` files in `SAT_SALOME`
 (294 products, plus applications, jobs, machines).
@@ -197,7 +892,7 @@ SMESH = false                 # ERROR -- false does not remove a product; member
 ```
 
 Each raises at load time naming the key, before any configuration is built. The
-reasoning is D10; the ergonomic cost and what would relax it are in §13.
+reasoning is D10; the ergonomic cost and what would relax it are in §14.
 
 There is no declared schema for these keys yet -- the inventory above is measured from
 the corpus, not enforced by code -- so this snippet is the reference for what a written
@@ -207,63 +902,13 @@ file should look like until one exists.
 
 | | |
 |---|---|
-| `workdir` | `${LOCAL.workdir}` and `${VARS.sep}` come from layers this file never sees. The reference mechanism is what keeps the path platform-neutral (§2, consequence 4). |
+| `workdir` | `${LOCAL.workdir}` and `${VARS.sep}` come from layers this file never sees. The reference mechanism is what keeps the path platform-neutral (§17, consequence 4). |
 | `${workdir}` in `environ.build` | a bare name, resolved by walking **up** the parent chain from `environ.build` to `APPLICATION`. It does not need the full path, exactly as in pyconf. |
 | `ROOT_SALOME_INSTALL` | `"$PRODUCT_ROOT_DIR"` stays literal: `$` not followed by `{` is an ordinary character (§4). A shell variable passes through untouched. |
 | `dev`, `debug`, `python3`, `properties.*` | quoted `"no"` / `"yes"`, never `false` / `true`. SAT compares against those strings, so a boolean would silently read as `"no"` (D10). |
 | `CONFIGURATION = {}` | the canonical "include at `APPLICATION.tag`, no overrides". `KERNEL = true` is the accepted alias; `false` is refused (D10). |
 | `VTK_SMP_IMPLEMENTATION_TYPE` | `"TBB"` was a bare unquoted `TBB` in pyconf. TOML forces the quotes, which removes a real ambiguity. |
-| `[[__overwrite__]]` | an array of tables. The assignment keys **must stay quoted** -- unquoted, `APPLICATION.products.gcc` would nest into three tables instead of naming one key (§2, consequence 3). |
-
-### What the lock costs and saves, measured
-
-> **Implementation note.** Realised. `get_config` validates the lock after two files
-> (internal and local) and returns early, so a warm invocation reads **2 sources instead
-> of 12** on the test fixture and skips projects, application, products and user entirely.
-> `can_reuse` in `lock.py` does the validation: it checks the lock against the inputs the
-> lock itself recorded, which is what makes the check possible before any layer is read.
-> Measured end to end: `sat prepare TOMLBENCH` 0.23 s against `sat prepare APPLI_TEST`
-> 0.48 s, with one lock reused across all four of prepare's config builds.
-
-Every SAT command rebuilds the whole configuration from scratch
-(`src/salomeTools.py:430`), including sub-commands invoked through the runner API. The
-lock therefore replaces a repeated 461-file parse with a single JSON read.
-
-On `MEDCOUPLING-9.12.0`, 42 products:
-
-| operation | time | lock size |
-|---|---|---|
-| full `get_config` from pyconf | 0.081 s | — |
-| `read_lock`, one JSON file | **0.002 s** | 51 KB |
-| | **39x faster** | |
-
-On `SALOME-9.12.0-MPI`, 148 products, the product layer alone parses in 0.278 s, and
-`collapse_products` adds 0.005 s.
-
-The figure that matters is not one command but a delegating one. `sat prepare`
-(`commands/prepare.py:176-200`) calls `get_products_list` itself and then invokes
-`clean`, `source` and `patch` through the API — **four full configuration builds for one
-user action**:
-
-| | `sat prepare` |
-|---|---|
-| today, pyconf | 0.32 s |
-| via the lock | **0.01 s** |
-
-Two conclusions follow, and they shape §8's integration rather than merely justifying it.
-
-**The lock must be a file, not an in-memory cache.** Each sub-command is a separate
-rebuild, so nothing held in process survives to the next one.
-
-**`is_stale` runs four times per `sat prepare`**, which is why it compares mtime and size
-rather than hashing 294 product files — the check has to be cheaper than the work it
-avoids, four times over.
-
-It also means **removing the four rebuilds is not the fix**. Passing one configuration
-down from `prepare` to its delegates would save ~10 ms once the lock exists, while
-introducing a re-entrancy requirement nothing in SAT has today: `get_product_section`
-mutates the tree for incremental products, so the second command would see the first
-command's overlay. Making repeated work cheap beats making the control flow cleverer.
+| `[[__overwrite__]]` | an array of tables. The assignment keys **must stay quoted** -- unquoted, `APPLICATION.products.gcc` would nest into three tables instead of naming one key (§17, consequence 3). |
 
 ### Premise correction
 
@@ -271,288 +916,11 @@ The source prompt states TOML has "interpolation of variables". It does not —
 that is a deliberate non-goal of the format. Interpolation must be layered on
 top as a string convention we parse ourselves (§4).
 
----
-
-## 3. Decisions
-
-| # | Decision | Rationale |
-|---|---|---|
-| D1 | TOML expresses references as shell-style `${SECTION.key}`, converted at load into `pyconf.Reference` / `Expression` objects | Reads well for the newcomer audience the feature targets; needs no pyconf internals |
-| D2 | `JsonWriter` has two modes: **resolved** (the lock, default) and **raw** (`--raw`, templates preserved) | Resolved serves the runtime; raw is a diagnostic for inspecting templates pre-resolution |
-| D3 | TOML is accepted at **all six layers** (INTERNAL, LOCAL, PROJECTS, APPLICATION, PRODUCTS, USER) | Uniform; no rule about where TOML is allowed |
-| D4 | Both `X.pyconf` and `X.toml` for one layer is a **fatal error** naming both paths. SAT **refuses to write** a TOML-sourced layer | Silent precedence is exactly how two files drift apart unnoticed — the "double parsing" pitfall from the prompt |
-| D5 | Parser is stdlib `tomllib` only. Python < 3.11 raises a clear error pointing at `.pyconf` | Zero dependencies; no parser code we own |
-| D6 | The lock is **machine-local and gitignored**, fully resolved (— *"fully" is contingent on §16*) | A resolved SAT config contains absolute paths, distro tag and user name — it is not portable, so it must not pretend to be |
-| D7 | The lock is **platform-evaluated**: products are collapsed to their single applicable section, other platforms discarded | See §5 — this is what removes the eager-resolution hazard |
-| D8 | Collapsed products are stored **flat with a `__section__` marker**; `get_product_config` gains an early branch to use them verbatim | The platform decision is made exactly once, so runtime cannot diverge from the lock |
-| D9 | `src/pyconf.py` is **not modified** | Hard constraint from the prompt |
-| D10 | A `bool` is valid **only** inside `APPLICATION.products`, and only as `true`. The canonical spelling of a product with no overrides is `{}`; `true` is an accepted alias; `false` is refused. Booleans anywhere else raise, naming the key | A bool never equals a str, so `debug = true` fails `== "yes"` (`src/compilation.py:59`) and reads as **off**, while `SMESH = false` passes `isinstance(version, bool)` (`src/product.py:77`) and reads as **enabled** -- both silently, in opposite directions. Coercion would need a complete list of yes/no-typed keys, which `properties` (open-ended, shared with product files) makes impossible to maintain; rejection needs no list. `{}` routes through the Mapping branch to the same `version = APPLICATION.tag` with no value to mistype. Two properties worth recording, since both are easy to re-open later: the rule is **positional**, so a bool reaching the products position by the `__overwrite__` dotted-key route (`"APPLICATION.products.SMESH" = false`) is refused too, where coercion would have silently assigned the *version string* `"no"`; and rejection is the **reversible** choice -- a file written under the strict rule stays valid if the rule is later relaxed to coercion, whereas a file written under coercion breaks if the rule is ever tightened. Measured cost to the corpus: zero. Across the 162 application files there is no bool anywhere outside `APPLICATION.products.<name>`, and none in any `__overwrite__` assignment. The cost is ergonomic -- see §13 |
-
-### D5 note — the version constraint is softer than it looks
-
-`tomllib` is stdlib only from Python 3.11, while SAT runs on the system Python of
-every supported distro (`src/internal_config/distrib.pyconf`: CO/DB/FD/UB/MG/OS —
-Rocky 9 = 3.9, Ubuntu 22.04 = 3.10, Debian 11 = 3.9).
-
-But under the model in §1, **only the machine that generates the lock parses TOML**.
-Build machines consume JSON, which is stdlib on every version. Old-Python platforms
-can therefore consume locks; they simply cannot author from TOML.
-
----
-
-## 4. The `${}` grammar
-
-Minimal by design — it expresses what the corpus uses and nothing more.
-
-```toml
-source_dir    = "${APPLICATION.workdir}/SOURCES/${name}"
-compil_script = "${name}${VARS.scriptExtension}"
-archive       = "boost-${APPLICATION.products.boost}.tar.gz"
-literal       = "costs $${100}"    # -> literal "${100}"
-```
-
-- `${A.b.c}` and `${A["x"]}` become `pyconf.Reference`
-- adjacent parts become `pyconf.Expression(+, ...)`
-- `$${` escapes a literal `${`
-- an unterminated `${` is a **parse error**, never silently literal
-- a string with no `${` is a plain string — no scan, no surprises
-
----
-
-## 5. Platform evaluation (D7) — and the hazard it removes
-
-### The hazard
-
-`Reference.resolve` (`src/pyconf.py:932`) raises `ConfigResolutionError` when a
-reference cannot be found, and resolution today is **lazy** — it happens on
-attribute access, in whatever container context that access occurs.
-
-Writing a fully-resolved lock means resolving the entire tree **eagerly**, which is
-strictly more demanding than anything SAT does today. Every product file carries
-platform-specific sections that are inert on the current machine, e.g. in
-`boost.pyconf`:
-
-```
-default_win :
-{
-   compil_script : "boost_V" + $APPLICATION.products.boost + ".bat"
-   archive_info : {archive_name : "boost-" + $APPLICATION.products.boost + "_windows.tar.gz"}
-}
-```
-
-Nothing reads `default_win` on Linux today, so that reference is never evaluated.
-
-### The resolution
-
-SAT **already** discards non-matching platforms at merge time.
-`__overwrite__` / `__condition__` (`src/pyconf.py:1614`) is evaluated against the
-current machine:
-
-```
-__condition__ : "VARS.dist in ['CO9']"
-__condition__ : "VARS.dist in ['FD32', 'UB20.04']"
-__condition__ : "VARS.dist in ['CO7'] and APPLICATION.environ.build.VTK_SMP_IMPLEMENTATION_TYPE == 'TBB'"
-```
-
-So the merged tree is already platform-specific. What remains un-collapsed is only
-the per-product section family (`default`, `default_win`, `version_1_71_0`,
-`version_1_71_0_UB22_04`, …), collapsed later by `get_product_section`
-(`src/product.py:395`).
-
-**Running that collapse during lock generation, rather than at runtime, means
-`default_win` is *dropped* on Linux rather than evaluated.** The eager-resolution
-hazard disappears, and the lock becomes far smaller — one section per product
-instead of the ~15 in `boost.pyconf`.
-
-The lock is consequently platform- *and* application-specific, which is consistent
-with D6.
-
-> This revises an earlier position that the lock would mirror the config tree only.
-> It now bakes in the platform/section decision, which is `product.py` territory.
-
----
-
-## 6. Module layout
-
-New package `src/configio/`. Nothing outside it imports `tomllib`.
-
-| file | responsibility |
-|---|---|
-| `readers.py` | `Reader` ABC; `PyconfReader` (delegates to `src.pyconf`), `TomlReader`, `JsonReader`. Each returns a `src.pyconf.Config`. |
-| `writers.py` | `Writer` ABC; `JsonWriter` (resolved / raw), `PyconfWriter` (wraps existing `__save__`). No `TomlWriter`. |
-| `interp.py` | `${...}` grammar → `Reference` / `Expression`. The only new parser we own. |
-| `discovery.py` | layer resolution; the two-files-one-layer error (D4). |
-| `lock.py` | merge → platform collapse → write/read `sat.lock.json`; staleness. |
-
-`readers.py` only *constructs* pyconf's public classes — it does not modify them (D9).
-A `Config` rebuilt from a lock is a real `src.pyconf.Config`, so `product.py`,
-`environment.py` and every command keep working unchanged; they see plain strings
-where `Reference` objects used to be, which is what those resolve to anyway.
-
-### On the `Reader` factory in the prompt
-
-The prompt sketches one `Reader` ABC with three children, the TOML child lacking
-`write`. A child that raises `NotImplementedError` on half its interface is a sign
-the read and write axes want separating — hence `Reader` **and** `Writer` above:
-
-```
-Reader : PyconfReader, TomlReader, JsonReader
-Writer : PyconfWriter, JsonWriter
-```
-
-Read-capable = {pyconf, toml, json}; write-capable = {pyconf, json}. No crippled child.
-
----
-
-## 7. Lock generation
-
-- **Location:** `<LOCAL.workdir>/.sat/<APPLICATION>.lock.json` *(assumption — not yet confirmed)*
-- **Content:** merged tree with `__overwrite__` applied by the existing merger, then
-  each product collapsed via `get_product_section` into a flat block carrying `__section__`
-- **Staleness:** header records `sat_version`, `VARS.dist`, application name, and
-  `(path, mtime, size)` for every source file consumed. Any mismatch regenerates.
-  `sat config --relock` forces.
-- **Shape:**
-
-```json
-{
-  "__lock__": { "sat_version": "5.x", "dist": "UB24.04", "application": "MYAPP",
-                "sources": [["applications/MYAPP.toml", 1756800000, 812]] },
-  "PRODUCTS": {
-    "boost": {
-      "__section__": "version_1_71_0",
-      "name": "boost",
-      "patches": [],
-      "source_dir": "/home/flo/ws/MYAPP/SOURCES/boost"
-    }
-  }
-}
-```
-
----
-
-## 8. Integration points
-
-| file | change |
-|---|---|
-| `commands/config.py:234` `get_config` | route the 6 load sites through `discovery`; add lock stage |
-| `src/product.py:38` `get_product_config` | early branch on `__section__` (D8) |
-| `commands/init.py` (3 sites), `commands/config.py:651`, `commands/jobs.py:1773` | refuse to write when the layer's source was TOML, naming file and key (D4) |
-
-These are the only writers of config today; all go through `Config.__save__`.
-
----
-
-## 9. Test strategy
-
-The strongest asset is an **equivalence oracle**: `test/APPLI_TEST/APPLI_TEST.pyconf`
-translated to TOML, asserting both paths produce identical resolved trees. Every
-existing SAT behaviour then acts as a test for the TOML path.
-
-- **Unit** (TDD, written first): `${}` grammar including escapes and malformed input;
-  each reader/writer in isolation; ambiguity detection (D4); the `tomllib` version guard (D5).
-- **Integration:** write a TOML app → `sat config -v` → `sat compile`, following the
-  real user workflow.
-- **Roundtrip:** (a) TOML artefact ≡ pyconf artefact — the oracle above;
-  (b) `pyconf → json → Config` equivalence at resolved-value level.
-- **Second pass**, driven by *"what could fail without the user knowing immediately?"* —
-  candidates: a stale lock silently used after a source edit; a product collapsing to
-  the wrong section on an untested distro; `$${` mis-escaped so a literal becomes a reference.
-- **Final acceptance** (performed by the user, not this work): compile one SALOME
-  application from a TOML configuration.
-
----
-
-## 10. Rejected alternatives
-
-| Rejected | Why |
-|---|---|
-| Keep verbatim pyconf expression syntax inside TOML strings | Mechanical migration, but opaque to TOML tooling and depends on a pyconf internal entry point |
-| JSON as resolved-only, or raw-only | Resolved-only breaks the roundtrip requirement; raw-only defeats the "bash can parse it" motivation |
-| Committed, machine-independent lock | A resolved SAT config is machine-specific; a portable lock would require classifying every key as portable or local |
-| **Structured reference arrays** (`workdir = [{ref="LOCAL.workdir"}, ...]`) instead of `${}` strings | TOML parses the structure, so no string grammar is needed and values become machine-checkable -- but it is unpleasant to write for the common case, still needs a resolver, and would have to apply to all 8 reference paths including `products.cgal.tag`, where it is absurd |
-| **Forbidding references in TOML**, resolving everything at lock time | `${workdir}` inside `environ.build` refers to a sibling key in the same file; there is no earlier point at which SAT could compute it. The user would be asked to paste an absolute path |
-| **Alternative delimiters** (`{LOCAL.workdir}`, `@LOCAL.workdir`) | Cosmetic. `${}` is safer because `{` occurs in values such as `cmake_generator` and in CMake-flavoured strings generally |
-| **Defaulting `workdir` in SAT code** and omitting it from TOML | Tempting -- 162 files carry only two formulas, so it is a convention wearing a costume. But `$VARS.sep` is `os.path.sep` (`commands/config.py:148`) and is referenced 614 times across the corpus, so the grammar is required by the other 151 files regardless. Removing `workdir` would save one key while keeping the whole parser, and would make the TOML and pyconf layers express the same thing differently -- the divergence §9's oracle exists to catch. Revisit as a follow-up, not as part of this feature |
-| Vendored TOML parser, or `tomli` dependency | A subset parser that mis-reads valid TOML is a real hazard; a pip dependency fails on a fresh git clone. §3 D5 shows the constraint is soft |
-| **Universal lock pipeline** (all configs, including pure pyconf) | Imposes eager resolution on all 461 existing config files; `ConfigResolutionError` is a hard raise, so this surfaces latent failures in configs that work today |
-| **Sidecar lock** (written but never read back) | Contradicts the model — the lock would be a report, not the execution artifact |
-| Baking `get_product_config`'s full derived output (install_dir, dependency order) into the lock | Duplicates ~300 lines of logic into the lock schema, which can then drift. Only the *section* decision is baked (D7/D8) |
-
----
-
-## 11. Residual risks
-
-1. **Migration is all-or-nothing per configuration, not per file.** Converting one
-   file routes that user's remaining pyconf files through the lock. The platform
-   collapse (§5) removes the reference hazard, but this is a larger behavioural step
-   than "I changed one file" suggests. Must be stated in user documentation.
-2. **`get_product_section` has real subtlety** — incremental mode, version *ranges*
-   via `getRange_majorMinorPatch`, `_win` overlays. The lock generator must **call**
-   it, never reimplement it.
-3. **Windows** — the `default_win` collapse path cannot be tested on this machine.
-4. **Lock location** (§7) is an unconfirmed assumption.
-
----
-
-## 12. Out of scope (YAGNI)
-
-Backtick evaluation, `@include`, arithmetic beyond `+`, a TOML writer, a vendored
-TOML parser, a `RESOLVED` convenience section for jq, and committed portable locks.
-
----
-
-## 13. Evolution — if SAT detaches further from pyconf
-
-Several decisions here are shaped by one constraint: the object model and the value
-conventions are pyconf's, because 461 files and every consumer in `src/` and
-`commands/` assume them. That constraint is not permanent, and D10 in particular is
-the visible cost of it. If pyconf ever stops being the lingua franca, the following
-becomes available — in this order, because each step makes the next one safe.
-
-**Step 1 — grow the oracle into coverage.** §9's differential test exists to compare
-two loaders. Its more valuable second life is as the regression net that `src/product.py`
-and `src/environment.py` have never had: 11 test files today, 3 of which touch either.
-Nothing below should be attempted before that net exists.
-
-**Step 2 — centralise the yes/no test.** 58 direct `== "yes"` / `== "no"` comparisons
-across 14 files (`src/product.py` 19, `commands/package.py` 11, `src/environment.py` 10),
-plus the two helpers `appli_test_property` and `product_test_property` already used at
-33 call sites. Route all of them through one predicate that accepts `True` and `"yes"`
-alike. This is mechanical and behaviour-preserving: pyconf files keep passing strings
-and keep working.
-
-Note the hidden half. Values are not only compared, they are **emitted** —
-`src/environment.py:896` writes `pi.base` straight into a generated environment, and
-formats it into a `module load` line two statements later. Emission sites cannot be
-found by grepping for a comparison; they look like ordinary variable use, so this step
-is an audit by reading, not by pattern.
-
-**Step 3 — relax the reader.** Only once steps 1 and 2 hold can `_convert_bool` start
-returning `True` where it currently raises. This is why D10 rejects rather than coerces:
-every TOML file written under the strict rule is still valid the day the rule loosens,
-so no user's configuration is invalidated by the change. Coercing today would spend
-that option for an ergonomic gain available later anyway.
-
-**What would still not follow.** Two residuals survive any amount of detachment,
-because neither is about pyconf:
-
-- `environ` is an open key space whose values become environment variables. `true`
-  rendered as `"yes"` may not be what the consuming program wants — the corpus writes
-  `SALOME_USE_64BIT_IDS = "1"`. No rule infers the right spelling; only the author knows.
-- Distinguishing a bool typed into a string-valued key (`tag = true`) from a bool meant
-  as a flag requires knowing which keys are string-typed. That is a **schema**, and §2's
-  inventory is measured from the corpus rather than declared. Writing that schema down
-  is the prerequisite, and it is a larger piece of work than anything above — it is also
-  what would let TOML tooling validate a SAT configuration before SAT ever reads it.
-
----
-
-## 14. Appendix — format correspondence (source material for user documentation)
+## 18. Format correspondence (source material for user documentation)
 
 Not a constraint on the implementation. This is the reference a person converting a
 configuration needs, collected here so that `doc/src/configuration.rst` has something
-to be written from once the feature ships. §11.1 already records that the
+to be written from once the feature ships. §15.1 already records that the
 per-configuration migration rule must reach the user documentation; this table is the
 other half of that debt.
 
@@ -584,11 +952,9 @@ Reading it as a migration guide, the rows that cost people time are the ones whe
 pyconf allows something TOML does not spell the same way: a bare word value now needs
 quotes, a bare product key becomes `{}` or `true`, a yes/no flag stays a quoted string
 rather than becoming a boolean (§3, D10), and an `__overwrite__` target must be quoted
-so TOML does not nest it. The worked example in §2 shows all four in place.
+so TOML does not nest it. The worked example in §17 shows all four in place.
 
----
-
-## 15. Impact map — what changes for existing users
+## 19. Impact map — what changes for existing users
 
 Tasks 1 to 7 add modules nothing calls; no existing behaviour can change. Tasks 8 to 11
 modify code every SAT invocation runs. This section enumerates each mechanism they
@@ -608,7 +974,7 @@ be bit-for-bit unaffected.* Table A is where that claim is actually at risk.
 
 **A1 and A2 are the whole risk of the feature.** Neither is TOML-specific: they are
 edits to the shared path, made for the benefit of files that do not exist yet. The
-mitigation is §9's oracle, which is why §13 step 1 says to grow it into real coverage
+mitigation is §9's oracle, which is why §14 step 1 says to grow it into real coverage
 of `product.py` and `environment.py` before anything else.
 
 ### B. Mechanisms a user opts into by converting one file
@@ -618,7 +984,7 @@ through the lock.
 
 | # | mechanism | what the user sees | warning owed |
 |---|---|---|---|
-| B1 | migration is per configuration, not per file | converting one file routes all layers, including untouched pyconf ones, through the lock | yes -- already recorded as §11.1 |
+| B1 | migration is per configuration, not per file | converting one file routes all layers, including untouched pyconf ones, through the lock | yes -- already recorded as §15.1 |
 | B2 | resolution becomes eager | `ConfigResolutionError` at load instead of at first access. A latent broken reference that never fired now stops the run | yes. This is the reason §10 rejects the universal lock pipeline; the same hazard applies to whoever opts in |
 | B3 | platform collapse | the lock holds one section per product, chosen for this machine. Other platforms' sections are gone from it | yes -- and it is why the lock must never be committed |
 | B4 | a new artifact appears | `<LOCAL.workdir>/.sat/<APPLICATION>.lock.json` | yes, with the `.gitignore` line (see C2) |
@@ -652,243 +1018,3 @@ Items A1, A2 and A4 need no user-facing warning by definition: if they are visib
 they are bugs. They need review attention instead, which is the opposite allocation to
 the list above and worth stating explicitly, since the instinct is to document what was
 hardest to write rather than what is hardest to live with.
-
-
----
-
-## 16. Open decision — eager resolution cannot complete
-
-**Status: DECIDED — option 2. Implemented in Task 8; `collapse_products` calls
-`get_product_config`. See "Outcome" at the end of this section.**
-
-### What happens
-
-Building a real configuration with the real `get_config`, collapsing it, then writing it
-with `JsonWriter(resolved=True)`:
-
-| application | products | result |
-|---|---|---|
-| `MEDCOUPLING-9.12.0` | 42 | succeeds — 51 KB lock |
-| `SALOME-9.12.0-MPI` | 148 | **fails** |
-
-```
-ConfigResolutionError: unable to evaluate $install_dir
-in the configuration default.environ
-```
-
-### Why it is structural, not a bug
-
-`install_dir` appears in no product file. `get_product_config` computes it by calling
-`get_install_dir` at runtime and attaches it to the product info it returns. A product
-whose `environ` block references `$install_dir` therefore holds a reference that resolves
-only *after* runtime derivation — while the writer runs before it, by construction.
-
-| reference | occurrences | files | resolvable at lock time |
-|---|---|---|---|
-| `$install_dir` | **521** | **33** | **no** — attached by `get_install_dir` at runtime |
-| `$name` | 1114 | 274 | yes — `name` is a key in the section |
-
-Collapsing does not help: this is not a platform-dead section (§5) nor a latent broken
-reference (§15 B2). It is a reference into a value that does not exist yet, by design.
-
-Worth noting how it was nearly missed: `MEDCOUPLING-9.12.0` contains none of those 33
-products, so it locks cleanly. Validating against one application would have shipped it.
-
-### The options
-
-| # | option | what changes | cost |
-|---|---|---|---|
-| **1** | **Partial lock.** Leave `environ` blocks unresolved in the lock; `environment.py` resolves them at runtime as it does today | §4, §7; Task 5 gains a per-region mode; Task 6 must revive pyconf `$`-syntax inside those regions | The lock stops being uniformly resolved, so it has two modes in one document. Directly reverses Task 6's rule that `JsonReader` parses no templates — a rule that exists to stop a raw dump being loaded as an execution input. The "bash and jq can read it" motivation (§10) weakens wherever a value is still a template |
-| **2** | **Derive `install_dir` during collapse.** `collapse_products` calls `get_install_dir` and stores the result, so `$install_dir` resolves like any other key | D6, D8, §10; Task 8's `collapse_products` | Pulls one derived value into the lock, which §10 rejected for `get_product_config`'s output as a whole. That rejection was about **duplicating ~300 lines**; *calling* the existing function is not duplication — it is the same principle Task 8 already applies to `get_product_section`. `is_stale` gains a new reason to invalidate, since `install_dir` depends on `base` and `install_mode`, which can change with no source file changing |
-| **3** | **Exclude affected products.** Products with runtime-only references are not locked and fall back to the pyconf path | §1, D6 | Breaks the model: the lock is no longer the artifact SAT executes against, and a configuration is half locked. Rejected unless 1 and 2 both prove worse |
-| **4** | **Resolve nothing; lock raw only.** The lock becomes a normalised source cache, not an execution artifact | §1, §7, D2, D6 | Abandons the `Cargo.lock` model the feature is built on, and the eager-resolution benefit with it. Listed for completeness |
-
-### Recommendation
-
-**Option 2.** It keeps one representation, one resolution pass, and one implementation of
-the install-directory decision. The drift §10 feared comes from reimplementing a
-decision, not from invoking it — and Task 8 already establishes invoking as the pattern.
-Option 1 is the alternative worth taking seriously if pulling derived values into the
-lock proves to cascade: the moment `install_dir` is in there, the next reviewer will ask
-why `source_dir` and `build_dir` are not.
-
-The deciding question is narrow enough to state: **is `install_dir` part of the decision
-the lock records, or part of the work the lock feeds?** Option 2 says the former, option 1
-the latter. Nothing else in this document answers it.
-
-### Outcome
-
-Option 2 was taken. `collapse_products` calls `get_product_config` rather than
-`get_product_section`, so the lock stores the product info SAT actually derived --
-`install_dir`, `install_mode` and the rest -- and `$install_dir` resolves like any other
-key. One call, no reimplementation, the same principle Task 8 already applies to section
-selection.
-
-`get_product_config` keeps `install_dir_save` bookkeeping for repeat calls, so a second
-collapse adds that one key while every value stays identical. That is pinned by
-`test_collapsing_twice_changes_no_value`.
-
-**The `$install_dir` failure class is gone.** Locking all 162 applications:
-
-| | applications |
-|---|---|
-| lock cleanly | **116** |
-| fail | **46** |
-
-The 46 fall into three classes. **Two are genuine upstream configuration bugs; the third
-is an artifact of the measurement** and is not a bug at all:
-
-| apps | failure | verdict |
-|---|---|---|
-| 36 | `TypeError: can only concatenate str (not "bool") to str` | **bug** — see U1 below |
-| 4 | `AttributeError: Unknown pyconf key: 'version_6_1_0_MPI'` | **bug** — see U2 below |
-| 6 | `SatException: openssl has version 1.1.1n but is declared as native` | **not a bug** — Windows applications resolved on Linux. `openssl.pyconf` is incremental; `default` sets `get_source : "native"` and `default_win` overrides it to `"archive"`. On Windows the overlay yields `archive` and resolves correctly. Resolving a Windows application on Linux is not a supported operation, and the lock is platform-specific by construction (D7) -- so this is the measurement reaching somewhere it should not have |
-
-So **40 of 162 applications, 25%, are blocked by two fixable lines**, and the lock is what
-found them. Neither is a regression: each fails today too, later and with less context.
-
-### The two upstream fixes
-
-**U1 — `OPENTURNS_SALOME.pyconf`, `default` section: delete the `compil_script` line.**
-Affects 36 applications.
-
-```
-build_source  : "cmake"           # <- not "script"
-compil_script : $name + "-" + $APPLICATION.products.OPENTURNS_SALOME + $VARS.scriptExtension
-```
-
-The expression builds a script filename from the version the application requested. That
-idiom is correct for a **prerequisite** — 72 product files use it, and applications pin
-those versions. But `OPENTURNS_SALOME` is declared with a bare key in **all 46** of the
-applications that include it, and pinned in none, so the reference resolves to `True` and
-the concatenation cannot ever succeed.
-
-It has gone unnoticed because the key is **dead**: `build_source` is `"cmake"`, and
-`compil_script` is only read when `product_has_script()` is true, which requires
-`build_source.lower() == 'script'` (`src/product.py:1161`). Nothing reads the key, so its
-expression has never had to evaluate.
-
-Deleting the line is the right fix, not pinning a version: a cmake-built product has no
-compile script. It is dead configuration that happens to be wrong.
-
-*Scope check, because the obvious worry is that this is systemic:* of 55 products ever
-declared bare — including the 15 always-bare internally-developed ones such as `SHAPER`,
-`SHAPERSTUDY`, `YDEFX` and `PARAVISADDONS` — **`OPENTURNS_SALOME` is the only one whose
-file references `$APPLICATION.products.<self>`**. `KERNEL`, `GUI`, `GEOM` and `SMESH` are
-not even always-bare, and never name their own version. The modules are immune because a
-git checkout at the application tag never needs its version in a filename. The single
-cross-product reference in the corpus is `hdf5_openmpi` reading `hdf5`, which is pinned in
-161 of 162 applications. **One file using the prerequisite idiom while consumed as a
-module — not a class.**
-
-**U2 — `SALOME-10.0.0*.pyconf`: `ParaView` asks for a section that does not exist.**
-Affects 4 applications.
-
-```
-ParaView : {tag:'6.1.0.c61dcc8ee0', base:'no', section:'version_6_1_0_MPI', hpc:'yes'}
-```
-
-`ParaView.pyconf` defines `default`, `version_6_0_0`, `version_6_0_0_MPI`,
-`version_6_0_0_MPI_CO9`, `version_6_0_0_MPI_FD44` and `version_6_0_0_win`. There is no
-`version_6_1_0_MPI` anywhere in the corpus. An explicit `section:` bypasses version
-matching entirely (`src/product.py:429`), so the miss is immediate rather than falling
-back to `default`.
-
-### Consequent open question
-
-What should lock generation do when a configuration has a latent error of this kind?
-
-- **Abort, naming the key and the expression.** Strictly more useful than today's failure,
-  which arrives during a build. But 28% of applications cannot adopt TOML until their
-  configuration is fixed -- and 36 of them need one line changed in one product file.
-- **Resolve what resolves, keep the rest raw.** Preserves today's behaviour exactly: the
-  broken value fails when read, not before. Reintroduces option 1's two-modes problem.
-
-**Decided: abort — but report every failure, not the first.**
-
-Aborting is right: a latent error found at load time, with the key and the expression
-named, beats the same error arriving mid-build. But dying on the first unresolvable value
-is what made this investigation expensive. The first run reported one `TypeError` with no
-indication that 35 other applications shared one cause, or that a second, unrelated bug
-accounted for 4 more, or that 6 of the failures were not bugs at all.
-
-So lock generation **collects** unresolvable values and reports them together:
-
-- group by cause, not by application — one entry for U1, not 36
-- name the key path, the expression, and the value that broke it
-  (`$APPLICATION.products.OPENTURNS_SALOME` resolved to `True`)
-- state the count of affected layers or products
-
-Same strictness, and the first encounter becomes an actionable list instead of a puzzle.
-This shapes Task 10's error path, and Task 5's writer needs to surface per-value failures
-rather than letting the first exception escape.
-
-
----
-
-## 17. Limits as a pyconf replacement
-
-This feature makes TOML a supported **input** format. It does not make TOML a replacement
-for pyconf, and the gap is deliberate rather than unfinished. If the objective becomes
-full replacement, D4 and §12 are what have to change first; `plan/13-extended-feature.md`
-plans that work.
-
-### What is replaced
-
-| | status |
-|---|---|
-| reading a configuration layer | TOML at all six layers (D3) |
-| `${}` interpolation | §4, layered onto TOML as a string convention |
-| the object model | unchanged — every reader produces `pyconf.Config` |
-| the execution artifact | the JSON lock (§1), for any configuration with a TOML layer |
-
-### What is not
-
-**SAT cannot write TOML.** D4, enforced by `writers.writer_for_layer`, which raises
-`TomlWriteRefused`. The consequences are concrete rather than theoretical:
-
-| command | consequence |
-|---|---|
-| `sat init --base`, `sat init --add_project` | refuses against a `local.toml`; the user edits the file themselves |
-| `sat config` first run | can create `SAT.pyconf`, never `SAT.toml` |
-| `sat package` | regenerates `local.pyconf` and `<product>.pyconf` into the archive, **silently converting a TOML-sourced configuration to pyconf** (impact map C1) |
-
-So a workspace cannot today be **pyconf-free**: `sat init` needs to write somewhere, and
-`sat package` emits pyconf regardless of what it read.
-
-### Why writing is the hard half
-
-Not a matter of effort ordering. Three facts, each verified:
-
-1. **`tomllib` is read-only.** It exports `load`, `loads` and `TOMLDecodeError` and
-   nothing else. Writing was left out of it, and an external writer such as `tomli_w`
-   violates the zero-dependency constraint (§3). Any TOML writer is written from scratch.
-2. **`tomllib` discards comments.** A `Config` built from TOML has none, so serialising
-   the tree back out cannot restore them. pyconf's `Config.__save__` *does* keep comment
-   content — it relocates a trailing comment onto its own line, but does not lose it. A
-   TOML writer that serialises from the tree is therefore strictly worse than the format
-   it replaces, for files humans maintain.
-3. **A `${}` re-serialiser does not exist.** `interp.parse_template` turns
-   `"${A.b}/x"` into `Reference`/`Expression`; nothing goes the other way. The lock's raw
-   mode emits pyconf `$`-syntax on purpose (§4), as a diagnostic, not as TOML.
-
-Preserving comments therefore needs **text-level editing of the original file**, which
-means a second, position-aware TOML scanner alongside `tomllib` — and two parsers that
-can disagree about one document.
-
-### The limit that is not about writing
-
-A TOML-only workspace still cannot escape the `yes`/`no` convention. SAT compares against
-those strings at 58 sites across 14 files, so `debug = true` reads as `"no"` (D10). That is
-independent of the writer and is planned separately in §13.
-
-### Summary
-
-| objective | status |
-|---|---|
-| accept TOML input | **done** |
-| execute against a generated artifact | **done** (the lock) |
-| leave pyconf configurations untouched | **done**, verified byte-identical |
-| author a configuration entirely in TOML | partial — readable, not writable |
-| a pyconf-free workspace | **not possible** — `sat init` and `sat package` both write pyconf |
-| booleans instead of `yes`/`no` | **no** — §13 |
