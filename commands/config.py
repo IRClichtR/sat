@@ -27,7 +27,8 @@ import pprint as PP
 import src
 import src.logger as LOG
 import src.debug as DBG
-from src.configio.discovery import resolve_layer, layer_is_toml
+from src.configio.discovery import (resolve_layer, layer_is_toml,
+                                    LAYER_EXTENSIONS)
 from src.configio.readers import reader_for
 from src.configio import lock as LOCK
 from src.configio.writers import writer_for_layer
@@ -97,6 +98,59 @@ def osJoin(*args):
     if True: # ".pyconf" in res:
       logger.info("osJoin %-80s in %s" % (res, CALN.caller_name(1)))
   return res
+
+def application_names(directory):
+    """\
+    List the applications defined in one directory, in any layer format.
+
+    :param directory str: A directory of APPLICATIONPATH.
+    :return: The application names, without extension, each once, in the
+             order of their sorted file names.
+    :rtype: list
+    """
+    # sorted by file name, not by name: 'A-MPI.pyconf' sorts before
+    # 'A.pyconf' but 'A' before 'A-MPI', and the listing order predates TOML
+    names = []
+    for f in sorted(os.listdir(directory)):
+        name, extension = os.path.splitext(f)
+        if extension in LAYER_EXTENSIONS and name not in names:
+            names.append(name)
+    return names
+
+def find_application_file(application, search_paths):
+    """\
+    Find the file defining an application, in any layer format.
+
+    Uses the same discovery as loading, so the file found is the one loaded.
+
+    :param application str: The application name.
+    :param search_paths list: The directories to search, in order.
+    :return: The file path, or None if no directory defines the application.
+    :rtype: str
+    :raise AmbiguousLayerError: If one directory defines it in two formats.
+    """
+    path, _reader = resolve_layer(application, list(search_paths))
+    return path
+
+def copy_destination(directory, name, source):
+    """\
+    Build the path of a personal copy of an application file.
+
+    The copy keeps the format of its source. A copy existing in any format is
+    refused, since a second format beside it would make the layer ambiguous.
+
+    :param directory str: The personal applications directory.
+    :param name str: The name of the copy, without extension.
+    :param source str: The application file being copied.
+    :return: The path to copy to.
+    :rtype: str
+    :raise SatException: If a personal application of that name exists.
+    """
+    existing, _reader = resolve_layer(osJoin(directory, name), [])
+    if existing is not None:
+        raise src.SatException(_("A personal application"
+                                 " '%s' already exists") % name)
+    return osJoin(directory, name + os.path.splitext(source)[1])
 
 class ConfigOpener:
     '''Class that helps to find an application pyconf 
@@ -1392,14 +1446,12 @@ def run(args, runner, logger):
             logger.write(_("Opening %s\n" % usercfg), 3)
             src.system.show_in_editor(editor, usercfg, logger)
         else:
-            # search for file <application>.pyconf and open it
-            for path in runner.cfg.PATHS.APPLICATIONPATH:
-                pyconf_path =  osJoin(path,
-                                    runner.cfg.VARS.application + ".pyconf")
-                if os.path.exists(pyconf_path):
-                    logger.write(_("Opening %s\n" % pyconf_path), 3)
-                    src.system.show_in_editor(editor, pyconf_path, logger)
-                    break
+            # search for the application file, in any format, and open it
+            appli_path = find_application_file(
+                runner.cfg.VARS.application, runner.cfg.PATHS.APPLICATIONPATH)
+            if appli_path is not None:
+                logger.write(_("Opening %s\n" % appli_path), 3)
+                src.system.show_in_editor(editor, appli_path, logger)
     
     # case : give information about the product(s) in parameter
     if options.products:
@@ -1434,20 +1486,14 @@ def run(args, runner, logger):
         # product is required
         src.check_config_has_application( runner.cfg )
 
-        # get application file path 
-        source = runner.cfg.VARS.application + '.pyconf'
-        source_full_path = ""
-        for path in runner.cfg.PATHS.APPLICATIONPATH:
-            # ignore personal directory
-            if path == runner.cfg.VARS.personalDir:
-                continue
-            # loop on all directories that can have pyconf applications
-            zz =  osJoin(path, source)
-            if os.path.exists(zz):
-                source_full_path = zz
-                break
+        # get application file path, in any format, ignoring the
+        # personal directory
+        source = runner.cfg.VARS.application
+        source_full_path = find_application_file(
+            source, [path for path in runner.cfg.PATHS.APPLICATIONPATH
+                     if path != runner.cfg.VARS.personalDir])
 
-        if len(source_full_path) == 0:
+        if source_full_path is None:
             raise src.SatException(_(
                         "Config file for product %s not found\n") % source)
         else:
@@ -1462,12 +1508,10 @@ def run(args, runner, logger):
                 # use same name as source
                 dest = runner.cfg.VARS.application
                 
-            # the full path
-            dest_file =  osJoin(runner.cfg.VARS.personalDir,
-                                     'Applications', dest + '.pyconf')
-            if os.path.exists(dest_file):
-                raise src.SatException(_("A personal application"
-                                         " '%s' already exists") % dest)
+            # the full path, in the format of the source
+            dest_file = copy_destination(
+                osJoin(runner.cfg.VARS.personalDir, 'Applications'),
+                dest, source_full_path)
             
             # perform the copy
             shutil.copyfile(source_full_path, dest_file)
@@ -1486,12 +1530,7 @@ def run(args, runner, logger):
                 logger.write(src.printcolors.printcError(_(
                                             "Directory not found")) + "\n")
             else:
-                for f in sorted(os.listdir(path)):
-                    # ignore file that does not ends with .pyconf
-                    if not f.endswith('.pyconf'):
-                        continue
-
-                    appliname = f[:-len('.pyconf')]
+                for appliname in application_names(path):
                     if appliname not in lproduct:
                         lproduct.append(appliname)
                         if path.startswith(runner.cfg.VARS.personalDir) \
