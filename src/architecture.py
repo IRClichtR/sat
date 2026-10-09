@@ -33,11 +33,28 @@ except Exception:
     try:
         from distro import linux_distribution
     except Exception:
-        print ("\nError :\n"
-               "  linux_distribution was removed from platform module in Python 3.8+\n"
-               "  For python 3.8+ sat requires distro module to get information on linux distribution.\n"
-               "  Please install distro module with : pip install distro")
-        sys.exit(-1)
+        # distro is not installed: fall back on /etc/os-release (python 3.10+)
+        try:
+            from platform import freedesktop_os_release
+        except ImportError:
+            print ("\nError :\n"
+                   "  linux_distribution was removed from platform module in Python 3.8+\n"
+                   "  For python 3.8+ sat requires distro module to get information on linux distribution.\n"
+                   "  Please install distro module with : pip install distro")
+            sys.exit(-1)
+
+        def linux_distribution():
+            '''fallback used when distro is not installed: read /etc/os-release
+
+            :rtype: tuple (name, version, codename), like distro.linux_distribution
+            '''
+            try:
+                info = freedesktop_os_release()
+            except OSError:
+                return ("", "", "")
+            return (info.get("NAME", ""),
+                    info.get("VERSION_ID", ""),
+                    info.get("VERSION_CODENAME", ""))
 
 
 def is_windows():
