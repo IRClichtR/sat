@@ -60,14 +60,14 @@ class TestResolve(unittest.TestCase):
         paths = VF.make_fake_project(self.root, local_extra=local_extra)
         return VF.load_config(paths["data"]), paths
 
-    def test_resolve_default(self):
+    def test_default_venv_path(self):
         cfg, paths = self._config()
-        self.assertEqual(VENV.resolve_venv_path(cfg, "default"),
+        self.assertEqual(VENV.default_venv_path(cfg),
                          os.path.join(paths["workdir"], "venv"))
 
     def test_resolve_path_is_absolute(self):
         cfg, _ = self._config()
-        self.assertTrue(os.path.isabs(VENV.resolve_venv_path(cfg, "relative/venv")))
+        self.assertTrue(os.path.isabs(VENV.resolve_venv_path("relative/venv")))
 
     def test_resolve_venv_dir_unset(self):
         cfg, _ = self._config()

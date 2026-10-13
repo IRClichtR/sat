@@ -73,7 +73,19 @@ class TestDistroFallback(unittest.TestCase):
             self.skipTest("distro not installed")
         arch = load_fresh_architecture()
         self.assertEqual(arch.linux_distribution()[:2],
-                         distro.linux_distribution()[:2])
+                         (distro.name(), distro.version()))
+
+    def test_with_distro_no_deprecation_warning(self):
+        # distro.linux_distribution() is deprecated: sat must not call it
+        try:
+            import distro
+        except ImportError:
+            self.skipTest("distro not installed")
+        import warnings
+        arch = load_fresh_architecture()
+        with warnings.catch_warnings():
+            warnings.simplefilter("error", DeprecationWarning)
+            arch.linux_distribution()
 
 
 if __name__ == '__main__':

@@ -42,6 +42,27 @@ parser.add_option('t', 'tag', 'string', 'tag',
                   _('Optional: The tag of SAT (only informative)'))
 parser.add_option('l', 'log_dir', 'string', 'log_dir', 
                   _('Optional: The directory where to put all the logs of SAT'))
+parser.add_option('', 'venv', 'string', 'venv',
+                  _('Optional: create or select the virtual environment used '
+                    'by the --venv option of other commands: --venv alone uses '
+                    '<workdir>/venv, --venv <path> uses that path, --venv forget '
+                    'forgets it (the directory is kept)'))
+
+def normalize_venv_arg(args, default_path):
+    """ Give a value to a bare --venv (getopt has no optional values).
+
+    :param args list: the arguments of the init command.
+    :param default_path str: the venv path used when --venv has no value.
+    :return: a copy of args where a --venv that is last, or followed by
+             another option, becomes --venv=<default_path>
+    :rtype: list
+    """
+    result = list(args)
+    for i, arg in enumerate(result):
+        if arg == "--venv" and (i + 1 == len(result)
+                                or result[i + 1].startswith("-")):
+            result[i] = "--venv=" + default_path
+    return result
 
 def set_local_value(config, key, value, logger):
     """ Edit the site.pyconf file and change a value.
@@ -153,6 +174,8 @@ def display_local_values(config, logger):
             ("VCS", config.LOCAL.VCS),
             ("tag", config.LOCAL.tag),
             ("projects", config.PROJECTS.project_file_paths)]
+    if "venv" in config.LOCAL:
+        info.append(("venv", config.LOCAL.venv))
     src.print_info(logger, info)
 
     return 0
@@ -200,7 +223,8 @@ def run(args, runner, logger):
     '''method that is called when salomeTools is called with init parameter.
     '''
     
-    # Parse the options
+    # Parse the options (a bare --venv means the default venv path)
+    args = normalize_venv_arg(args, src.venv.default_venv_path(runner.cfg))
     (options, args) = parser.parse_args(args)
     
     # Print some informations
@@ -239,6 +263,10 @@ def run(args, runner, logger):
             res_set = set_local_value(runner.cfg, key, value, logger)
             res += res_set
     
+    # create/select or forget the venv used by --venv
+    if options.venv:
+        res += src.venv.init_venv(runner.cfg, options.venv, logger)
+
     display_local_values(runner.cfg, logger)
     
     return res

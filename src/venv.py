@@ -19,8 +19,8 @@
 '''
 Virtual environment support (option --venv).
 
-A venv is created once with "sat init --venv <path|default|none>" and its path
-is stored in LOCAL.venv. Commands given --venv build and run the application
+A venv is created once with "sat init --venv [<path>]" (no path: <workdir>/venv)
+and its path is stored in LOCAL.venv; "sat init --venv forget" forgets it. Commands given --venv build and run the application
 against it. See VENV_FEAT_DESIGN.md.
 '''
 
@@ -51,14 +51,21 @@ def is_venv(venv_dir):
     return os.path.isfile(os.path.join(venv_dir, "pyvenv.cfg"))
 
 
-def resolve_venv_path(config, value):
-    '''Turn a LOCAL.venv value into an absolute path
+# value of "sat init --venv" that forgets the configured venv
+FORGET = "forget"
 
-    :param value str: a path, or "default" for $LOCAL.workdir/venv
+
+def default_venv_path(config):
+    '''Venv used by "sat init --venv" when no path is given'''
+    return os.path.join(config.LOCAL.workdir, "venv")
+
+
+def resolve_venv_path(value):
+    '''Turn a venv path (as given or as stored in LOCAL.venv) into an
+    absolute path
+
     :rtype: str
     '''
-    if value == "default":
-        return os.path.join(config.LOCAL.workdir, "venv")
     return os.path.abspath(os.path.expanduser(value))
 
 
@@ -70,12 +77,12 @@ def resolve_venv_dir(config):
     '''
     if "venv" not in config.LOCAL:
         raise src.SatException(
-            _("no venv configured: run 'sat init --venv <path|default>'"))
-    venv_dir = resolve_venv_path(config, config.LOCAL.venv)
+            _("no venv configured: run 'sat init --venv [<path>]'"))
+    venv_dir = resolve_venv_path(config.LOCAL.venv)
     if not is_venv(venv_dir):
         raise src.SatException(
             _("the venv configured in LOCAL.venv (%s) does not exist or is not "
-              "a virtual environment: run 'sat init --venv <path|default>' "
+              "a virtual environment: run 'sat init --venv [<path>]' "
               "again") % venv_dir)
     return venv_dir
 
@@ -135,3 +142,50 @@ def create_venv(venv_dir, sat_path, logger):
     wrapper = write_wrapper(venv_dir, sat_path)
     logger.write(_("sat wrapper: %s\n") % wrapper, 3)
     return 0
+
+
+def _save_local_venv(config, value):
+    '''Write (or remove when value is None) LOCAL.venv in data/local.pyconf'''
+    local_file_path = os.path.join(config.VARS.datadir, "local.pyconf")
+    local_cfg = src.pyconf.Config(local_file_path)
+    if value is None:
+        if "venv" in local_cfg.LOCAL:
+            del local_cfg.LOCAL["venv"]
+    else:
+        local_cfg.LOCAL["venv"] = value
+    with open(local_file_path, 'w') as ff:
+        local_cfg.__save__(ff, 1)
+    if value is None:
+        if "venv" in config.LOCAL:
+            del config.LOCAL["venv"]
+    else:
+        config.LOCAL["venv"] = value
+
+
+def init_venv(config, value, logger):
+    '''Implementation of "sat init --venv [<path>|forget]"
+
+    :param value str: a path (commands/init.py turns a bare --venv into
+                      default_venv_path), or FORGET
+    :rtype: int
+    :return: 0 if OK, 1 on error
+    '''
+    try:
+        if value == FORGET:
+            _save_local_venv(config, None)
+            logger.write(_("venv forgotten. You can safely remove from disk.\n"), 1)
+            return 0
+
+        venv_dir = resolve_venv_path(value)
+        sat_path = os.path.join(config.VARS.salometoolsway, "sat")
+        if create_venv(venv_dir, sat_path, logger) != 0:
+            return 1
+        # written last: a failed init leaves local.pyconf untouched
+        _save_local_venv(config, venv_dir)
+        logger.write(_("venv ready: %s\nactivate it with: source %s\n") %
+                     (venv_dir, os.path.join(venv_bin_dir(venv_dir), "activate")), 1)
+        return 0
+    except Exception as e:
+        logger.write(src.printcolors.printcError(
+            _("Unable to configure the venv: %s\n") % str(e)), 1)
+        return 1

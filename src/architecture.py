@@ -31,7 +31,14 @@ try:
     from platform import linux_distribution
 except Exception:
     try:
-        from distro import linux_distribution
+        import distro
+
+        def linux_distribution():
+            '''same tuple as distro.linux_distribution(), which is deprecated
+
+            :rtype: tuple (name, version, codename)
+            '''
+            return (distro.name(), distro.version(), distro.codename())
     except Exception:
         # distro is not installed: fall back on /etc/os-release (python 3.10+)
         try:
