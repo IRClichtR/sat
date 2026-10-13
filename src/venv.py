@@ -24,6 +24,7 @@ and its path is stored in LOCAL.venv; "sat init --venv forget" forgets it. Comma
 against it. See VENV_FEAT_DESIGN.md.
 '''
 
+import json
 import os
 import sys
 import stat
@@ -189,3 +190,122 @@ def init_venv(config, value, logger):
         logger.write(src.printcolors.printcError(
             _("Unable to configure the venv: %s\n") % str(e)), 1)
         return 1
+
+
+def split_native_products(config):
+    '''Split the native products of the application (D2)
+
+    :rtype: tuple (venv_products, system_products)
+    :return: venv_products: [(product_key, pip_name)] native products with
+             property pip "yes"; system_products: [(product_key, product_info)]
+             every other native product. Both sorted by product key.
+    '''
+    venv_products = []
+    system_products = []
+    for product in sorted(config.APPLICATION.products):
+        product_info = src.product.get_product_config(config, product)
+        if not src.product.product_is_native(product_info):
+            continue
+        if src.product.product_test_property(product_info, "pip", "yes"):
+            venv_products.append((product, product_info.name))
+        else:
+            system_products.append((product, product_info))
+    return venv_products, system_products
+
+
+def get_requirements(config, venv_products, logger):
+    '''pip requirement of each venv product, pinned with APPLICATION.venv (D10)
+
+    :rtype: dict
+    :return: {product_key: "pip_name" or "pip_name==pin"}
+    '''
+    pins = {}
+    if "venv" in config.APPLICATION:
+        for key in config.APPLICATION.venv:
+            pins[key] = str(config.APPLICATION.venv[key])
+    requirements = {}
+    for key, pip_name in venv_products:
+        if key in pins:
+            requirements[key] = "%s==%s" % (pip_name, pins.pop(key))
+        else:
+            requirements[key] = pip_name
+    for key in sorted(pins):
+        logger.warning(_("APPLICATION.venv.%s is ignored: %s is not a native "
+                         "pip product of the application") % (key, key))
+    return requirements
+
+
+# run by the venv interpreter: argv[1] is a json list of distribution names,
+# prints {name: [version, location] or null}. The first distribution found on
+# sys.path wins (the one "import" would load).
+_CHECK_SCRIPT = r'''
+import json, re, sys
+try:
+    from importlib import metadata
+except ImportError:
+    import importlib_metadata as metadata
+def norm(name):
+    return re.sub(r"[-_.]+", "-", name).lower()
+found = {}
+for dist in metadata.distributions():
+    name = dist.metadata["Name"]
+    if name and norm(name) not in found:
+        found[norm(name)] = [dist.version, str(dist.locate_file(""))]
+print(json.dumps(dict((n, found.get(norm(n))) for n in json.loads(sys.argv[1]))))
+'''
+
+
+def check_venv_pkgs(venv_dir, pip_names):
+    '''Check which distributions the venv interpreter sees
+
+    :param pip_names list: distribution names (product "name" keys)
+    :rtype: dict
+    :return: {name: {"status": "OK"|"KO", "version": str|None,
+                     "origin": "venv"|"system"|None}}
+    '''
+    output = subprocess.check_output([venv_python(venv_dir), "-c",
+                                      _CHECK_SCRIPT, json.dumps(list(pip_names))])
+    raw = json.loads(output.decode("utf-8"))
+    venv_root = os.path.realpath(venv_dir) + os.sep
+    result = {}
+    for name in pip_names:
+        if raw.get(name) is None:
+            result[name] = {"status": "KO", "version": None, "origin": None}
+            continue
+        version, location = raw[name]
+        in_venv = (os.path.realpath(location) + os.sep).startswith(venv_root)
+        result[name] = {"status": "OK", "version": version,
+                        "origin": "venv" if in_venv else "system"}
+    return result
+
+
+def install_venv_pkgs(config, venv_dir, requirements, logger):
+    '''pip install the requirements into the venv, caching the downloaded
+    files in $LOCAL.archive_dir/wheels (same place as sat compile)
+
+    :param requirements list: pip requirement strings ("toml", "toml==0.10.2")
+    :rtype: int
+    :return: the number of requirements that could not be installed
+    '''
+    if not requirements:
+        return 0
+    python = venv_python(venv_dir)
+    wheels_dir = os.path.join(config.LOCAL.archive_dir, "wheels")
+    src.ensure_path_exists(wheels_dir)
+    pip = [python, "-m", "pip", "--disable-pip-version-check"]
+    failures = 0
+    for requirement in requirements:
+        logger.write(_("pip install %s in %s\n") % (requirement, venv_dir), 3)
+        # failure ignored: the wheel may already be cached (offline use)
+        subprocess.call(pip + ["download", "-q", "--dest", wheels_dir, requirement])
+        rc = subprocess.call(pip + ["install", "-q", "--no-index",
+                                    "--find-links", wheels_dir, requirement])
+        if rc != 0:
+            # an sdist may need build dependencies from the index
+            rc = subprocess.call(pip + ["install", "-q",
+                                        "--find-links", wheels_dir, requirement])
+        if rc != 0:
+            failures += 1
+            logger.write(src.printcolors.printcError(
+                _("Error: pip could not install %s\n") % requirement), 1)
+    return failures
