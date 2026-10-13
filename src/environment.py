@@ -26,6 +26,7 @@ import shutil
 
 import src
 import src.debug as DBG
+import src.venv
 import pprint as PP
 
 
@@ -654,6 +655,9 @@ class SalomeEnviron:
         if src.product.product_is_native(pi):
             if src.product.product_has_env_script(pi):
                 self.run_env_script(pi, native=True)
+            # venv mode (option --venv): the native python is the venv one
+            if product == "Python" and "venv_dir" in self.cfg.VARS:
+                src.venv.apply_venv_env(self, self.cfg.VARS.venv_dir)
             return
                
         # Set an additional environment for SALOME products

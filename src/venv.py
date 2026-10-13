@@ -309,3 +309,40 @@ def install_venv_pkgs(config, venv_dir, requirements, logger):
             logger.write(src.printcolors.printcError(
                 _("Error: pip could not install %s\n") % requirement), 1)
     return failures
+
+
+def enable_venv_mode(config, logger):
+    '''Turn venv mode on for this sat command (option --venv)
+
+    :raise SatException: no application, Python not native (D11), or no venv
+    :rtype: str
+    :return: the venv path, also stored in config.VARS.venv_dir
+    '''
+    src.check_config_has_application(config)
+    if "Python" not in config.APPLICATION.products:
+        raise src.SatException(
+            _("--venv requires the application to declare Python as 'native'"))
+    python_info = src.product.get_product_config(config, "Python")
+    if not src.product.product_is_native(python_info):
+        raise src.SatException(
+            _("this application builds its own Python, which is already "
+              "isolated: --venv is not needed"))
+    venv_dir = resolve_venv_dir(config)
+    config.VARS.venv_dir = venv_dir
+    logger.write(_("venv mode: %s\n") % venv_dir, 3)
+    return venv_dir
+
+
+def apply_venv_env(env, venv_dir):
+    '''Point the native python environment to the venv (D12)
+
+    PYTHON_ROOT_DIR, PYTHON_INCLUDE, PYTHON_LIBRARY and PYTHON_VERSION are kept:
+    a venv has no headers nor libpython of its own.
+
+    :param env: SalomeEnviron or Environ (anything with set and prepend)
+    '''
+    python = venv_python(venv_dir)
+    env.set("VIRTUAL_ENV", venv_dir)
+    env.prepend("PATH", venv_bin_dir(venv_dir))
+    env.set("PYTHONBIN", python)
+    env.set("Python3_EXECUTABLE", python)
