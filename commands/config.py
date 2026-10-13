@@ -21,6 +21,7 @@ import sys
 import platform
 import datetime
 import shutil
+import subprocess
 import gettext
 import pprint as PP
 
@@ -68,6 +69,15 @@ parser.add_option('', 'show_properties', 'boolean', 'show_properties',
     _("Optional: synthetic list of all properties used in the application"))
 parser.add_option('', 'check_system', 'boolean', 'check_system',
     _("Optional: check if system products are installed"))
+parser.add_option('', 'venv', 'boolean', 'venv',
+    _("Optional: with --check_system, check the native python products in the "
+      "venv configured with 'sat init --venv'"))
+parser.add_option('', 'install_venv', 'boolean', 'install_venv',
+    _("Optional: with --check_system --venv, pip install the missing python "
+      "products into the venv"))
+parser.add_option('', 'install_system', 'boolean', 'install_system',
+    _("Optional: with --check_system, install the missing system packages "
+      "(sudo apt-get/dnf, asks for confirmation)"))
 parser.add_option('c', 'copy', 'boolean', 'copy',
     _("""Optional: copy a config file to the personal config files directory.
 WARNING: the included files are not copied.
@@ -851,43 +861,128 @@ def show_patchs(config, logger):
   else:
     logger.write("No patchs found\n", 1)
 
-def check_install_system(config, logger):
-  '''Check the installation of all (declared) system products
+def _native_products(config, logger):
+  '''[(product, product_info)] for every native product of the application'''
+  products = []
+  for product in sorted(config.APPLICATION.products):
+    try:
+      product_info = src.product.get_product_config(config, product)
+    except Exception as e:
+      msg = "\nproblem with the check of system prerequisite %s\n%s\n" % (product, str(e))
+      logger.error(msg)
+      raise Exception(msg)
+    if src.product.product_is_native(product_info):
+      products.append((product, product_info))
+  return products
+
+def _check_system_products(config, check_cmd, products, logger):
+  '''Display the system dependencies of products, return the missing ones
+
+  :rtype: tuple (run_dep_ko, build_dep_ko)
+  '''
+  run_dep_ko=[] # list of missing run time dependencies
+  build_dep_ko=[] # list of missing compile time dependencies
+  for product, product_info in products:
+    try:
+      # get (in two dictionnaries the runtime and compile time
+      # system dependencies with the status (OK/KO)
+      run_pkg,build_pkg=src.product.check_system_dep(config.VARS.dist, check_cmd, product_info)
+      for pkg in run_pkg:
+          logger.write("\n   - "+pkg + " : " + run_pkg[pkg], 1)
+          if "KO" in run_pkg[pkg]:
+              run_dep_ko.append(pkg)
+      for pkg in build_pkg:
+          logger.write("\n   - "+pkg + " : " + build_pkg[pkg], 1)
+          if "KO" in build_pkg[pkg]:
+              build_dep_ko.append(pkg)
+    except Exception as e:
+      msg = "\nproblem with the check of system prerequisite %s\n%s\n" % (product, str(e))
+      logger.error(msg)
+      raise Exception(msg)
+  return run_dep_ko, build_dep_ko
+
+def _check_venv_products(config, venv_products, logger):
+  '''Display the venv group status, return the missing [(product, pip_name)]'''
+  venv_dir = config.VARS.venv_dir
+  logger.write("\nVenv packages (pip, %s)\n" % venv_dir, 1)
+  try:
+    status = src.venv.check_venv_pkgs(venv_dir, [name for _p, name in venv_products])
+  except (subprocess.CalledProcessError, OSError, ValueError) as e:
+    raise src.SatException(_("unable to query the venv %s (%s): "
+                             "run 'sat init --venv [<path>]' again") % (venv_dir, e))
+  missing = []
+  for product, name in venv_products:
+    st = status[name]
+    if st["status"] == "OK":
+      text = src.printcolors.printcSuccess("OK") + " (%s %s)" % (st["origin"], st["version"])
+    else:
+      text = src.printcolors.printcError("KO") + " (not installed)"
+      missing.append((product, name))
+    logger.write("\n   - %s : %s" % (product, text), 1)
+  logger.write("\n", 1)
+  return missing
+
+def check_install_system(config, logger, venv=False, install_venv=False,
+                         install_system=False, batch=False):
+  '''Check (and optionally install) the system products of the application
 
   :param config Config: the global configuration.
   :param logger Logger: The logger instance to use for the display
+  :param venv bool: split native products between venv (pip) and system groups
+                    (config.VARS.venv_dir must be set, see src.venv.enable_venv_mode)
+  :param install_venv bool: pip install the missing venv products
+  :param install_system bool: install the missing system packages
+  :param batch bool: sat batch mode (no question)
+  :rtype: int
+  :return: 0 if everything requested succeeded, else 1
   '''
   # get the command to use for checking the system dependencies
   # (either rmp or apt)
   check_cmd=src.system.get_pkg_check_cmd(config.VARS.dist_name)
   logger.write("\nCheck the system dependencies declared in the application\n",1)
   pkgmgr=check_cmd[0]
-  run_dep_ko=[] # list of missing run time dependencies
-  build_dep_ko=[] # list of missing compile time dependencies
-  for product in sorted(config.APPLICATION.products):
-    try:
-      product_info = src.product.get_product_config(config, product)
-      if src.product.product_is_native(product_info):
-        # if the product is native, get (in two dictionnaries the runtime and compile time 
-        # system dependencies with the status (OK/KO)
-        run_pkg,build_pkg=src.product.check_system_dep(config.VARS.dist, check_cmd, product_info)
-        #logger.write("\n*** %s ***\n" % product, 1)
-        for pkg in run_pkg:
-            logger.write("\n   - "+pkg + " : " + run_pkg[pkg], 1)
-            if "KO" in run_pkg[pkg]:
-                run_dep_ko.append(pkg)
-        for pkg in build_pkg:
-            logger.write("\n   - "+pkg + " : " + build_pkg[pkg], 1)
-            if "KO" in build_pkg[pkg]:
-                build_dep_ko.append(pkg)
-        #  logger.write(src.printcolors.printcInfo("    %s\n" % i), 1)
+  if venv:
+    venv_products, system_products = src.venv.split_native_products(config)
+    logger.write("\nSystem packages (%s)\n" % pkgmgr, 1)
+  else:
+    venv_products, system_products = [], _native_products(config, logger)
 
-    except Exception as e:
-      msg = "\nproblem with the check of system prerequisite %s\n%s\n" % (product, str(e))
-      logger.error(msg)
-      raise Exception(msg)
-
+  run_dep_ko, build_dep_ko = _check_system_products(config, check_cmd, system_products, logger)
+  venv_missing = []
+  if venv:
+    logger.write("\n", 1)
+    venv_missing = _check_venv_products(config, venv_products, logger)
   logger.write("\n\n",1)
+
+  res = 0
+  # 1- venv first (no root needed)
+  if install_venv and venv_missing:
+    requirements = src.venv.get_requirements(config, venv_products, logger)
+    failures = src.venv.install_venv_pkgs(config, config.VARS.venv_dir,
+                                          [requirements[p] for p, _p in venv_missing],
+                                          logger)
+    venv_missing = _check_venv_products(config, venv_products, logger)
+    if failures or venv_missing:
+      res = 1
+  elif venv_missing:
+    logger.warning("Some python packages are missing in the venv %s!\n"
+                   "Install them with: sat config %s --check_system --venv --install_venv"
+                   % (config.VARS.venv_dir, config.VARS.application))
+
+  # 2- then system packages
+  missing_system = sorted(set(run_dep_ko + build_dep_ko))
+  if install_system and missing_system:
+    install_cmd = src.system.get_pkg_install_cmd(config.VARS.dist_name)
+    if src.system.install_system_pkgs(missing_system, install_cmd, batch, logger) != 0:
+      res = 1
+    else:
+      logger.write("\nCheck again the system dependencies\n", 1)
+      run_dep_ko, build_dep_ko = _check_system_products(config, check_cmd,
+                                                        system_products, logger)
+      logger.write("\n\n", 1)
+      if run_dep_ko or build_dep_ko:
+        res = 1
+
   if run_dep_ko:
       msg="Some run time system dependencies are missing!\n"+\
           "Please install them with %s before running salome" % pkgmgr
@@ -905,7 +1000,8 @@ def check_install_system(config, logger):
       for md in build_dep_ko: 
         logger.write(md+" ",1)
       logger.write("\n\n")
-    
+  return res
+
 
 def show_dependencies(config, products, logger):
     '''Prints dependencies of products in the application.
@@ -1141,7 +1237,11 @@ def run(args, runner, logger):
     '''
     # Parse the options
     (options, args) = parser.parse_args(args)
-    
+
+    # workflow rules of the install options (D19)
+    src.venv.check_install_options(options.check_system, options.venv,
+                                   options.install_venv, options.install_system)
+
     # print products list based from the properties key
     if options.properties:
         products_infos = src.product.get_products_list(options, runner.cfg, logger)
@@ -1354,5 +1454,10 @@ def run(args, runner, logger):
 
     # check system prerequisites
     if options.check_system:
-       check_install_system(runner.cfg, logger)
-       pass 
+       if options.venv:
+           src.venv.enable_venv_mode(runner.cfg, logger)
+       return check_install_system(runner.cfg, logger,
+                                   venv=bool(options.venv),
+                                   install_venv=bool(options.install_venv),
+                                   install_system=bool(options.install_system),
+                                   batch=bool(runner.options.batch))

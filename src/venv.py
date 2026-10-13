@@ -346,3 +346,14 @@ def apply_venv_env(env, venv_dir):
     env.prepend("PATH", venv_bin_dir(venv_dir))
     env.set("PYTHONBIN", python)
     env.set("Python3_EXECUTABLE", python)
+
+
+def check_install_options(check_system, venv, install_venv, install_system):
+    '''Workflow rules of sat config (D19)
+
+    :raise SatException: if a rule is violated
+    '''
+    if (install_venv or install_system) and not check_system:
+        raise src.SatException(_("--install_* requires --check_system"))
+    if install_venv and not venv:
+        raise src.SatException(_("--install_venv requires --venv"))
