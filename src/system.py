@@ -23,6 +23,7 @@ like open a browser or an editor, or call a git command
 
 import os
 import subprocess as SP
+import shutil
 import time
 import tarfile
 import time
@@ -544,3 +545,63 @@ def check_system_pkg(check_cmd,pkg):
     :return: a string with package name with status un message
     '''
     return check_system_pkgs(check_cmd, [pkg])[pkg]
+
+def get_pkg_install_cmd(dist_name):
+    '''Build the command (without package names) used to install linux packages
+
+    :param dist_name str: the distribution code (see internal_config/distrib.pyconf)
+    :rtype: list or None
+    :return: e.g. ["apt-get", "install", "-y"], or None if not supported here
+    '''
+    if dist_name in ["DB", "UB", "MN"]:
+        candidates = ["apt-get"]
+    elif dist_name in ["CO", "FD"]:
+        candidates = ["dnf", "yum"]
+    else:
+        return None
+    for tool in candidates:
+        if shutil.which(tool):
+            return [tool, "install", "-y"]
+    return None
+
+def install_system_pkgs(pkgs, install_cmd, batch, logger, ask=None, call=None):
+    '''Install system packages, after showing the command and asking
+
+    :param pkgs list: the packages to install
+    :param install_cmd list: the result of get_pkg_install_cmd (may be None)
+    :param batch bool: sat batch mode: nothing is asked, nothing is installed
+    :param ask function: asks the confirmation (default: input)
+    :param call function: runs the command (default: subprocess.call)
+    :rtype: int
+    :return: 0 if installed or nothing to install, else 1
+    '''
+    if ask is None:
+        ask = input
+    if call is None:
+        call = SP.call
+    if not pkgs:
+        logger.write(_("No missing system package\n"), 3)
+        return 0
+    if install_cmd is None:
+        logger.write(src.printcolors.printcError(
+            _("No supported system package manager on this platform, please "
+              "install manually: %s\n") % " ".join(sorted(pkgs))), 1)
+        return 1
+    cmd = list(install_cmd) + sorted(pkgs)
+    if not (hasattr(os, "geteuid") and os.geteuid() == 0):
+        cmd = ["sudo"] + cmd
+    cmd_str = " ".join(cmd)
+    if batch:
+        logger.write(_("Batch mode: system packages are not installed, "
+                       "please run:\n  %s\n") % cmd_str, 1)
+        return 1
+    logger.write(_("The following command will be run:\n  %s\n") % cmd_str, 1)
+    answer = ask(_("Proceed? [y/N] "))
+    if answer.strip().lower() not in ["y", "yes"]:
+        logger.write(_("Cancelled: system packages were not installed\n"), 1)
+        return 1
+    if call(cmd) != 0:
+        logger.write(src.printcolors.printcError(
+            _("Error: the system package installation failed\n")), 1)
+        return 1
+    return 0
