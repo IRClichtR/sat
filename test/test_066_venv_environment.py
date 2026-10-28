@@ -35,6 +35,7 @@ def fake_venv(path):
     os.makedirs(os.path.join(path, "bin"))
     with open(os.path.join(path, "pyvenv.cfg"), "w") as f:
         f.write("include-system-site-packages = true\n")
+    open(VENV.venv_python(path), "w").close()
     return path
 
 

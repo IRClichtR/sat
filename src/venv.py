@@ -48,8 +48,10 @@ def venv_python(venv_dir):
 
 
 def is_venv(venv_dir):
-    '''True if venv_dir is a virtual environment (has a pyvenv.cfg)'''
-    return os.path.isfile(os.path.join(venv_dir, "pyvenv.cfg"))
+    '''True if venv_dir is a virtual environment (has a pyvenv.cfg and its
+    interpreter)'''
+    return (os.path.isfile(os.path.join(venv_dir, "pyvenv.cfg")) and
+            os.path.exists(venv_python(venv_dir)))
 
 
 # value of "sat init --venv" that forgets the configured venv
@@ -203,7 +205,12 @@ def split_native_products(config):
     venv_products = []
     system_products = []
     for product in sorted(config.APPLICATION.products):
-        product_info = src.product.get_product_config(config, product)
+        try:
+            product_info = src.product.get_product_config(config, product)
+        except Exception as e:
+            raise src.SatException(
+                _("problem with the check of system prerequisite %s\n%s")
+                % (product, str(e)))
         if not src.product.product_is_native(product_info):
             continue
         if src.product.product_test_property(product_info, "pip", "yes"):
@@ -357,3 +364,16 @@ def check_install_options(check_system, venv, install_venv, install_system):
         raise src.SatException(_("--install_* requires --check_system"))
     if install_venv and not venv:
         raise src.SatException(_("--install_venv requires --venv"))
+
+
+def add_venv_option(parser):
+    '''Declare the --venv option of a command (long option only)'''
+    parser.add_option('', 'venv', 'boolean', 'venv',
+        _("Optional: build/run against the virtual environment configured "
+          "with 'sat init --venv' (Python must be native in the application)"))
+
+
+def handle_venv_option(options, config, logger):
+    '''Turn venv mode on if --venv was given'''
+    if options.venv:
+        enable_venv_mode(config, logger)

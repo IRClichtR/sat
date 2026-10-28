@@ -32,6 +32,7 @@ parser.add_option('t', 'target', 'string', 'out_dir',
     _("Optional: Specifies the directory path where to put the environment "
       "files."),
     None)
+src.venv.add_venv_option(parser)
 
 # list of available shells with extensions
 C_SHELLS = { "bash": "sh", "bat": "bat", "cfg" : "cfg", "tcl" : ""}
@@ -130,6 +131,7 @@ def description():
 # Runs the command.
 def run(args, runner, logger):
     (options, args) = parser.parse_args(args)
+    src.venv.handle_venv_option(options, runner.cfg, logger)
 
     # check that the command was called with an application
     src.check_config_has_application( runner.cfg )

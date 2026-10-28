@@ -24,6 +24,7 @@ import src
 parser = src.options.Options()
 parser.add_option('p', 'products', 'list2', 'products',
     _('Optional: products to install. This option accepts a comma separated list.'))
+src.venv.add_venv_option(parser)
 
 
 def log_step(logger, header, step):
@@ -156,6 +157,7 @@ def run(args, runner, logger):
     
     # Parse the options
     (options, args) = parser.parse_args(args)
+    src.venv.handle_venv_option(options, runner.cfg, logger)
 
     # check that the command has been called with an application
     src.check_config_has_application( runner.cfg )

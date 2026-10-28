@@ -478,6 +478,11 @@ class LauncherFileEnviron(FileEnviron):
                 launcher_header = launcher_modules_pip_header3
             else:
                 launcher_header=launcher_header3
+        # venv mode (sat launcher --venv): the launcher runs with the venv python
+        venv_python = self.environ.get("sat_venv_python")
+        if venv_python and not src.architecture.is_windows():
+            launcher_header = launcher_header.replace("#! /usr/bin/env python3",
+                                                      "#! " + venv_python, 1)
         # in case of Windows OS, Python scripts are not executable.  PyExe ?
         if src.architecture.is_windows():
             launcher_header = launcher_header.replace("#! /usr/bin/env python3",'')

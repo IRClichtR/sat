@@ -901,8 +901,12 @@ def _check_system_products(config, check_cmd, products, logger):
       raise Exception(msg)
   return run_dep_ko, build_dep_ko
 
-def _check_venv_products(config, venv_products, logger):
-  '''Display the venv group status, return the missing [(product, pip_name)]'''
+def _check_venv_products(config, venv_products, requirements, logger):
+  '''Display the venv group status, return the missing [(product, pip_name)]
+
+  A product pinned in the requirements ("name==X") whose found version is not
+  X is reported as missing.
+  '''
   venv_dir = config.VARS.venv_dir
   logger.write("\nVenv packages (pip, %s)\n" % venv_dir, 1)
   try:
@@ -913,7 +917,15 @@ def _check_venv_products(config, venv_products, logger):
   missing = []
   for product, name in venv_products:
     st = status[name]
-    if st["status"] == "OK":
+    pin = None
+    req = requirements.get(product, name)
+    if "==" in req:
+      pin = req.split("==", 1)[1]
+    if st["status"] == "OK" and pin is not None and st["version"] != pin:
+      text = src.printcolors.printcError("KO") + " (%s %s, pinned %s)" % (
+          st["origin"], st["version"], pin)
+      missing.append((product, name))
+    elif st["status"] == "OK":
       text = src.printcolors.printcSuccess("OK") + " (%s %s)" % (st["origin"], st["version"])
     else:
       text = src.printcolors.printcError("KO") + " (not installed)"
@@ -951,17 +963,17 @@ def check_install_system(config, logger, venv=False, install_venv=False,
   venv_missing = []
   if venv:
     logger.write("\n", 1)
-    venv_missing = _check_venv_products(config, venv_products, logger)
+    requirements = src.venv.get_requirements(config, venv_products, logger)
+    venv_missing = _check_venv_products(config, venv_products, requirements, logger)
   logger.write("\n\n",1)
 
   res = 0
   # 1- venv first (no root needed)
   if install_venv and venv_missing:
-    requirements = src.venv.get_requirements(config, venv_products, logger)
     failures = src.venv.install_venv_pkgs(config, config.VARS.venv_dir,
                                           [requirements[p] for p, _p in venv_missing],
                                           logger)
-    venv_missing = _check_venv_products(config, venv_products, logger)
+    venv_missing = _check_venv_products(config, venv_products, requirements, logger)
     if failures or venv_missing:
       res = 1
   elif venv_missing:

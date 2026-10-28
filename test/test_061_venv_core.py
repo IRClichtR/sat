@@ -91,6 +91,22 @@ class TestResolve(unittest.TestCase):
         with self.assertRaises(src.SatException):
             VENV.resolve_venv_dir(cfg)
 
+    def test_cfg_without_interpreter_is_not_a_venv(self):
+        broken = os.path.join(self.root, "broken")
+        os.makedirs(broken)
+        open(os.path.join(broken, "pyvenv.cfg"), "w").close()
+        self.assertFalse(VENV.is_venv(broken))
+        cfg, _ = self._config("venv : '%s'" % broken)
+        with self.assertRaises(src.SatException) as ctx:
+            VENV.resolve_venv_dir(cfg)
+        self.assertIn("sat init --venv", str(ctx.exception))
+
+    def test_create_venv_refuses_cfg_without_interpreter(self):
+        broken = os.path.join(self.root, "broken")
+        os.makedirs(broken)
+        open(os.path.join(broken, "pyvenv.cfg"), "w").close()
+        self.assertEqual(VENV.create_venv(broken, "/sat", VF.FakeLogger()), 1)
+
 
 class TestCreateVenv(unittest.TestCase):
     """One real venv for the whole class (creation takes a few seconds)."""

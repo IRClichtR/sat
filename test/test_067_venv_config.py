@@ -79,8 +79,9 @@ class TestCheckInstallSystem(unittest.TestCase):
     def setUp(self):
         self.root = tempfile.mkdtemp()
         self.venv_dir = os.path.join(self.root, "venv")
-        os.makedirs(self.venv_dir)
+        os.makedirs(os.path.join(self.venv_dir, "bin"))
         open(os.path.join(self.venv_dir, "pyvenv.cfg"), "w").close()
+        open(VENV.venv_python(self.venv_dir), "w").close()
         self.paths = VF.make_fake_project(self.root,
                                           local_extra="venv : '%s'" % self.venv_dir)
         self.logger = VF.FakeLogger()
@@ -140,6 +141,46 @@ class TestCheckInstallSystem(unittest.TestCase):
         self.assertEqual(rc, 0)
         install.assert_called_once_with(cfg, self.venv_dir, ["toml==0.10.2"], self.logger)
         self.assertIn("(venv 0.10.2)", self.logger.text)   # "OK" may carry color codes
+
+    def _run_pinned(self, version, extra_pins="", **kwargs):
+        cfg = VF.load_config(self.paths["data"],
+                             ["APPLICATION.venv={'pipnative' : '0.10.2'%s}" % extra_pins])
+        VENV.enable_venv_mode(cfg, self.logger)
+        seen = {"toml": {"status": "OK", "version": version, "origin": "system"}}
+        ok = {"toml": {"status": "OK", "version": "0.10.2", "origin": "venv"}}
+        with mock.patch("src.venv.check_venv_pkgs", side_effect=[seen, ok]), \
+             mock.patch("src.venv.install_venv_pkgs", return_value=0) as install:
+            rc = CONFIG_CMD.check_install_system(cfg, self.logger, venv=True, **kwargs)
+        return rc, install
+
+    def test_pin_differs_plain_check(self):
+        rc, install = self._run_pinned("0.9.0")
+        self.assertEqual(rc, 0)
+        install.assert_not_called()
+        self.assertIn("(system 0.9.0, pinned 0.10.2)", self.logger.text)
+        self.assertIn("Install them with", self.logger.text)
+
+    def test_pin_differs_installs_pin(self):
+        rc, install = self._run_pinned("0.9.0", install_venv=True)
+        self.assertEqual(rc, 0)
+        self.assertEqual(install.call_args[0][2], ["toml==0.10.2"])
+        self.assertIn("pinned 0.10.2", self.logger.text)
+
+    def test_pin_equal_is_ok(self):
+        rc, install = self._run_pinned("0.10.2", install_venv=True)
+        self.assertEqual(rc, 0)
+        install.assert_not_called()
+        self.assertIn("(system 0.10.2)", self.logger.text)
+        self.assertNotIn("pinned", self.logger.text)
+
+    def test_pin_warning_once(self):
+        rc, install = self._run_pinned("0.9.0", extra_pins=", 'nopipnative' : '1'",
+                                       install_venv=True)
+        self.assertEqual(self.logger.text.count("APPLICATION.venv.nopipnative is ignored"), 1)
+
+    def test_pin_warning_plain_check(self):
+        self._run_pinned("0.10.2", extra_pins=", 'nopipnative' : '1'")
+        self.assertEqual(self.logger.text.count("APPLICATION.venv.nopipnative is ignored"), 1)
 
     def test_install_venv_still_missing(self):
         cfg = VF.load_config(self.paths["data"])

@@ -28,6 +28,7 @@ parser.add_option('', 'nb_proc', 'int', 'nb_proc',
     _("""Optional: The number of processors to use in the script if the make command is used in it.
       Warning: the script has to be correctly written if you want this option to work.
       The $MAKE_OPTIONS has to be used."""), 0)
+src.venv.add_venv_option(parser)
 
 
 def log_step(logger, header, step):
@@ -174,6 +175,7 @@ def run(args, runner, logger):
     
     # Parse the options
     (options, args) = parser.parse_args(args)
+    src.venv.handle_venv_option(options, runner.cfg, logger)
 
     # check that the command has been called with an application
     src.check_config_has_application( runner.cfg )

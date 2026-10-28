@@ -589,6 +589,11 @@ def install_system_pkgs(pkgs, install_cmd, batch, logger, ask=None, call=None):
         return 1
     cmd = list(install_cmd) + sorted(pkgs)
     if not (hasattr(os, "geteuid") and os.geteuid() == 0):
+        if shutil.which("sudo") is None:
+            logger.write(src.printcolors.printcError(
+                _("sudo is not available: run as root or install manually: "
+                  "%s\n") % " ".join(cmd)), 1)
+            return 1
         cmd = ["sudo"] + cmd
     cmd_str = " ".join(cmd)
     if batch:
@@ -600,7 +605,13 @@ def install_system_pkgs(pkgs, install_cmd, batch, logger, ask=None, call=None):
     if answer.strip().lower() not in ["y", "yes"]:
         logger.write(_("Cancelled: system packages were not installed\n"), 1)
         return 1
-    if call(cmd) != 0:
+    try:
+        rc = call(cmd)
+    except OSError as e:
+        logger.write(src.printcolors.printcError(
+            _("Error: unable to run %s (%s)\n") % (cmd_str, e)), 1)
+        return 1
+    if rc != 0:
         logger.write(src.printcolors.printcError(
             _("Error: the system package installation failed\n")), 1)
         return 1

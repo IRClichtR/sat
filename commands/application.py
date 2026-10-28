@@ -46,6 +46,7 @@ parser.add_option('m', 'module', 'list2', 'modules',
 parser.add_option('', 'use_mesa', 'boolean', 'use_mesa',
     _("Optional: Create a launcher that will use mesa products\n\t"
       "It can be usefull whan salome is used on a remote machine through ssh"))
+src.venv.add_venv_option(parser)
 
 ##
 # Creates an alias for runAppli.
@@ -410,6 +411,7 @@ def run(args, runner, logger):
     '''
 
     (options, args) = parser.parse_args(args)
+    src.venv.handle_venv_option(options, runner.cfg, logger)
 
     # check for product
     src.check_config_has_application( runner.cfg )

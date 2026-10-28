@@ -26,6 +26,7 @@ parser.add_option('p', 'products', 'list2', 'products',
     _('Optional: products to configure. This option accepts a comma separated list.'))
 parser.add_option('o', 'option', 'string', 'option',
     _('Optional: Option to add to the configure or cmake command.'), "")
+src.venv.add_venv_option(parser)
 
 
 def log_step(logger, header, step):
@@ -157,6 +158,7 @@ def run(args, runner, logger):
     
     # Parse the options
     (options, args) = parser.parse_args(args)
+    src.venv.handle_venv_option(options, runner.cfg, logger)
 
     # check that the command has been called with an application
     src.check_config_has_application( runner.cfg )

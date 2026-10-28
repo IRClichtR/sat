@@ -63,6 +63,7 @@ parser.add_option('', 'check', 'boolean', 'check', _(
 
 parser.add_option('', 'clean_build_after', 'boolean', 'clean_build_after', 
                   _('Optional: remove the build directory after successful compilation'), False)
+src.venv.add_venv_option(parser)
 
 
 # from sat product infos, represent the product dependencies in a simple python graph
@@ -727,6 +728,7 @@ def run(args, runner, logger):
     '''
     # Parse the options
     (options, args) = parser.parse_args(args)
+    src.venv.handle_venv_option(options, runner.cfg, logger)
 
     # Warn the user if he invoked the clean_all option 
     # without --products option

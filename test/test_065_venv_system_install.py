@@ -70,6 +70,10 @@ class TestInstallSystemPkgs(unittest.TestCase):
         patcher = mock.patch("os.geteuid", return_value=1000, create=True)
         patcher.start()
         self.addCleanup(patcher.stop)
+        which = mock.patch("shutil.which", side_effect=lambda n, *a, **k:
+                           "/usr/bin/" + n if n == "sudo" else None)
+        which.start()
+        self.addCleanup(which.stop)
 
     def run_install(self, pkgs, batch=False, cmd=("apt-get", "install", "-y")):
         return SYS.install_system_pkgs(pkgs, list(cmd) if cmd else None, batch,
@@ -106,6 +110,20 @@ class TestInstallSystemPkgs(unittest.TestCase):
         self.assertEqual(self.run_install(["liba"], cmd=None), 1)
         self.call.assert_not_called()
         self.assertIn("liba", self.logger.text)
+
+    def test_sudo_missing(self):
+        with mock.patch("shutil.which", return_value=None):
+            self.assertEqual(self.run_install(["liba"]), 1)
+        self.ask.assert_not_called()
+        self.call.assert_not_called()
+        self.assertIn("sudo is not available", self.logger.text)
+        self.assertIn("apt-get install -y liba", self.logger.text)
+        self.assertNotIn("sudo apt-get", self.logger.text)
+
+    def test_call_oserror(self):
+        self.call.side_effect = OSError("no such file")
+        self.assertEqual(self.run_install(["liba"]), 1)
+        self.assertIn("no such file", self.logger.text)
 
     def test_root_no_sudo(self):
         with mock.patch("os.geteuid", return_value=0, create=True):

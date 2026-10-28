@@ -59,6 +59,7 @@ parser.add_option('', 'display', 'string', 'display',
           If value is NO then option --show-desktop=0 will be used to launch SALOME."""))
 parser.add_option('', 'keep', 'boolean', 'keeptempdir',
                   _('Optional: keep temporary big tests directories.'))
+src.venv.add_venv_option(parser)
 def description():
     '''method that is called when salomeTools is called with --help option.
     
@@ -602,6 +603,7 @@ def run(args, runner, logger):
     '''method that is called when salomeTools is called with test parameter.
     '''
     (options, args) = parse_option(args, runner.cfg)
+    src.venv.handle_venv_option(options, runner.cfg, logger)
 
     # the test base is specified either by the application, or by the --base option
     with_application = False

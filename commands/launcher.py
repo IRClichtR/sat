@@ -50,6 +50,7 @@ parser.add_option('', 'no_path_init', 'boolean', 'no_path_init',
                    "user's environment)\n\tUse no_path_init option to suppress the reinitilisation"
                    " of every paths (LD_LIBRARY_PATH, PYTHONPATH, ...)"))
 parser.add_option('', 'with-extra.env.d', 'boolean', 'with_extra_env_d', _('Optional: generate one environment per product'), False)
+src.venv.add_venv_option(parser)
 
 
 def generate_launch_file(config,
@@ -182,6 +183,10 @@ def generate_launch_file(config,
     else:
         additional_env['sat_INIT_SYS_PATH_VALUE']=  bin_kernel_install_dir
         additional_env['sat_MODULES_USE_PIP'] = '0'
+    # venv mode: the launcher runs with the venv python (D18)
+    if "venv_dir" in config.VARS:
+        additional_env['sat_venv_python'] = os.path.join(
+            src.venv.venv_bin_dir(config.VARS.venv_dir), "python3")
     # Display some information
     if display:
         # Write the launcher file
@@ -333,6 +338,7 @@ def run(args, runner, logger):
 
     # check for product
     (options, args) = parser.parse_args(args)
+    src.venv.handle_venv_option(options, runner.cfg, logger)
 
     # Verify that the command was called with an application
     src.check_config_has_application( runner.cfg )

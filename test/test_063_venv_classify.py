@@ -21,6 +21,10 @@
 import shutil
 import tempfile
 import unittest
+try:
+    from unittest import mock
+except ImportError:
+    import mock
 
 import initializeTest # set PATH etc for test
 import venv_fixture as VF
@@ -42,6 +46,21 @@ class TestSplit(unittest.TestCase):
         self.assertEqual(venv_products, [("pipnative", "toml")])
         self.assertEqual([k for k, _ in system_products],
                          ["Python", "nopipnative", "sysnative"])
+
+    def test_get_product_config_failure(self):
+        cfg = VF.load_config(self.paths["data"])
+        real = VENV.src.product.get_product_config
+
+        def fail_for_sysnative(config, product, *a, **k):
+            if product == "sysnative":
+                raise Exception("boom")
+            return real(config, product, *a, **k)
+        with mock.patch("src.product.get_product_config",
+                        side_effect=fail_for_sysnative):
+            with self.assertRaises(VENV.src.SatException) as ctx:
+                VENV.split_native_products(cfg)
+        self.assertIn("sysnative", str(ctx.exception))
+        self.assertIn("boom", str(ctx.exception))
 
     def test_non_native_excluded(self):
         cfg = VF.load_config(self.paths["data"])
